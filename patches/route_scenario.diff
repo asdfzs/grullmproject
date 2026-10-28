@@ -1,0 +1,18 @@
+diff --git a/leaderboard_autopilot/leaderboard/scenarios/route_scenario.py b/leaderboard_autopilot/leaderboard/scenarios/route_scenario.py
+index c5e7517..cf90686 100644
+--- a/leaderboard_autopilot/leaderboard/scenarios/route_scenario.py
++++ b/leaderboard_autopilot/leaderboard/scenarios/route_scenario.py
+@@ -400,8 +400,11 @@ class RouteScenario(BasicScenario):
+         # register var
+         self.scenario_triggerer = scenario_triggerer
+ 
+-        # Add the Background Activity
+-        behavior.add_child(BackgroundBehavior(self.ego_vehicles[0], self.route, name="BackgroundActivity"))
++        # Add the Background Activity (NO_BACKGROUND=1: empty roads - only the scenario's own actors)
++        if os.environ.get('NO_BACKGROUND', '0') != '1':
++            behavior.add_child(BackgroundBehavior(self.ego_vehicles[0], self.route, name="BackgroundActivity"))
++        else:
++            print('>> [RouteScenario] NO_BACKGROUND=1 -> no background traffic', flush=True)
+ 
+         behavior.add_children(scenario_behaviors)
+         return behavior
