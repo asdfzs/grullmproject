@@ -93,9 +93,17 @@ venv\Scripts\python.exe tools\final_report.py _final2
 
 `run_intervene.ps1` 주요 옵션: `-Trigger rule|gru`, `-Llm stub|claude`, `-GruThresh 0.99`, `-FallbackSec 12`, `-Perception perfect|noisy`, `-DebrisPolicy llm|always_bypass|off`, `-NoTraffic`, `-Suffix`.
 
-## 데이터
+## 문서와 결과
 
-수집한 CSV는 용량 때문에 올리지 않았습니다. 어떤 데이터인지는 [`docs/DATA.md`](docs/DATA.md)에 정리했습니다.
+| 위치 | 내용 |
+|---|---|
+| [`docs/PROGRESS.md`](docs/PROGRESS.md) | 진행 순서, 중간에 바꾼 결정과 이유, 남은 일 — **이어받는다면 먼저 읽기** |
+| [`docs/DATA.md`](docs/DATA.md) | 수집한 CSV 설명 (시나리오별 파일 수, 30개 열, 라벨 규칙) |
+| [`gru/model/MODEL.md`](gru/model/MODEL.md) | 최종 GRU 모델 카드 (학습 설정, 사용법, 성능, 주의점) |
+| [`results/`](results/README.md) | 교차 검증 리포트, 비용 분석 그래프, 최종 테스트, 확장 시나리오 결과 |
+| `data_sample/` | 샘플 CSV 2개 (고장차 1판, 대기열 1판) |
+
+전체 CSV(43판, 약 30분 주행)는 용량 때문에 올리지 않았습니다.
 
 ## 한계
 

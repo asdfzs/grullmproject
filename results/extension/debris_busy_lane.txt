@@ -1,0 +1,19 @@
+route                    policy         run result    compl   time coll  seen@ busy  decision     lanechg stop@obj stop all min gap merge wait brake forced
+165_debris_large_busy    always bypass  1   Completed   100  108.0    0    47m False BYPASS(rule) True       93.7s    93.6s    0.0m       0.0s     16.2m/s2
+165_debris_small_busy    always bypass  1   Perfect     100   13.6    0    46m False BYPASS(rule) True        0.5s     0.6s   -0.8m       0.0s     14.2m/s2
+165_debris_large_busy    ours (LLM)     1   Perfect     100   13.1    0    52m False BYPASS       True        0.6s     0.6s    2.1m       0.0s     16.8m/s2
+165_debris_small_busy    ours (LLM)     1   Perfect     100   10.1    0    51m False PROCEED      False       0.5s     0.6s       -       0.0s      0.0m/s2
+165_debris_small_busy    _db_always2    1   Perfect     100   13.1    0    53m False BYPASS(rule) True        0.8s     0.8s    0.9m       0.0s     12.7m/s2
+165_debris_small_busy    _db_llm3       1   Perfect     100   10.8    0    48m True  PROCEED      False       0.0s     0.6s       -       0.0s      0.0m/s2
+165_debris_small_busy    _db_noisy      1   Perfect     100   12.8    0    24m True  PROCEED      False       0.0s     0.6s       -       0.0s      0.0m/s2
+165_debris_small_busy    _db_noisy      2   Perfect     100   11.2    0    24m True  PROCEED      False       0.0s     0.6s       -       0.0s      0.0m/s2
+
+==== average per route x policy ====
+route                    policy          n completed collisions lane changes  stop s  min gap
+165_debris_large_busy    always bypass   1      1/1           0         1/1     93.6     0.0m
+165_debris_large_busy    ours (LLM)      1      1/1           0         1/1      0.6     2.1m
+165_debris_small_busy    _db_always2     1      1/1           0         1/1      0.8     0.9m
+165_debris_small_busy    _db_llm3        1      1/1           0         0/1      0.6        -
+165_debris_small_busy    _db_noisy       2      2/2           0         0/2      0.6        -
+165_debris_small_busy    always bypass   1      1/1           0         1/1      0.6    -0.8m
+165_debris_small_busy    ours (LLM)      1      1/1           0         0/1      0.6        -

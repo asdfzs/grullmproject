@@ -1,0 +1,34 @@
+Events: 24 should-call, 44 should-not-call  |  7.8 min of episodes that never need a call
+
+policy                       mean delay missed useless calls
+rule 1s                            1.0s      0       44/44
+rule 1s+car                        1.0s      0       33/44
+rule 2s                            2.0s      0       30/44
+rule 2s+car                        2.0s      0       29/44
+rule 3s                            3.0s      0       28/44
+rule 3s+car                        3.0s      0       26/44
+rule 5s                            5.0s      0       17/44
+rule 5s+car                        5.0s      0       13/44
+rule 8s                            8.0s      0        2/44
+rule 8s+car                        8.0s      0        1/44
+rule 10s                          10.0s      0        1/44
+rule 10s+car                      10.0s      0        1/44
+rule 15s                          14.8s      3        0/44
+rule 15s+car                      14.8s      3        0/44
+rule 20s                          18.8s      6        0/44
+rule 20s+car                      18.8s      6        0/44
+GRU P>=0.3                         5.6s      1        4/44
+GRU P>=0.5                         5.8s      1        4/44
+GRU P>=0.7                         6.0s      1        3/44
+GRU P>=0.85                        6.1s      1        3/44
+GRU P>=0.9                         6.2s      1        3/44
+GRU P>=0.95                        6.4s      1        2/44
+GRU P>=0.98                        6.7s      1        2/44
+GRU P>=0.99                        7.0s      2        1/44
+GRU P>=0.995                       7.5s      2        1/44
+
+Best policy for a given call cost C (one useless LLM call = C seconds of being stuck):
+  C= 2s: rule: rule 2s (cost 107) | rule+car: rule 1s+car (cost 89) | gru: GRU P>=0.3 (cost 143) | sched: GRU 0.95->0.5 by 5s (cost 148)
+  C= 5s: rule: rule 2s (cost 197) | rule+car: rule 5s+car (cost 184) | gru: GRU P>=0.3 (cost 155) | sched: GRU 0.95->0.5 by 12s (cost 158)
+  C=10s: rule: rule 8s (cost 211) | rule+car: rule 8s+car (cost 201) | gru: GRU P>=0.7 (cost 173) | sched: GRU 0.995->0.85 by 8s (cost 169)
+  C=20s: rule: rule 8s (cost 231) | rule+car: rule 8s+car (cost 211) | gru: GRU P>=0.99 (cost 188) | sched: GRU 0.995->0.85 by 8s (cost 189)

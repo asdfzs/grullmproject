@@ -1,0 +1,18 @@
+route              kind      result     compl   time  LLM calls (by)               answers                bypass 1st call @stop infractions        OK?
+194                official  Completed    100   60.9  0 []                                                False               - {}                 YES
+196                official  Completed    100   14.2  0 []                                                False               - {}                 YES
+200                official  Perfect      100   20.3  0 []                                                False               - {}                 YES
+201                official  Completed    100   22.1  0 []                                                False               - {}                 YES
+203                official  Completed    100   16.7  0 []                                                False               - {}                 YES
+210                official  Completed    100   16.4  0 []                                                False               - {}                 YES
+211                official  Perfect      100   14.1  0 []                                                False               - {}                 YES
+t160_broken        deadlock  Completed    100   20.0  1 ['gru']                    BYPASS                 True             0.8s {}                 YES
+t160_queue         resolves  Completed    100   35.5  2 ['gru', 'gru']             WAIT,WAIT              False            0.9s {}                 YES
+t160_stalled       deadlock  Completed    100   49.5  4 ['gru', 'gru', 'gru', 'g   WAIT,WAIT,WAIT,BYPASS  True             1.4s {}                 YES
+t160_stopgo        resolves  Completed    100   61.1  0 []                                                False               - {}                 YES
+t164_broken        deadlock  Completed    100   22.2  1 ['gru']                    BYPASS                 True             0.8s {}                 YES
+t164_queue         resolves  Completed    100   32.0  2 ['gru', 'gru']             WAIT,WAIT              False            0.8s {}                 YES
+t164_stalled       deadlock  Completed    100   54.4  4 ['gru', 'gru', 'gru', 'g   WAIT,WAIT,WAIT,BYPASS  True             1.6s {}                 YES
+t164_stopgo        resolves  Completed    100   58.1  1 ['gru']                    WAIT                   False            3.5s {}                 YES
+
+15/15 routes behaved as expected | LLM calls where none was needed: 5

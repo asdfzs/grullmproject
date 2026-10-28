@@ -1,0 +1,26 @@
+Leave-one-road-out (label: stop >= 12 s, no red)
+
+== test road 165  (train: 15 episodes from ['normal05', 'r157', 'r174', 'r180'], test: 17)
+  rule 5s                caught 16/16 delay  5.0s (deadlocks only  5.0s) | false alarms 1/13
+  rule 10s               caught 16/16 delay 10.0s (deadlocks only 10.0s) | false alarms 1/13
+  GRU P>=0.85            caught 16/16 delay  1.9s (deadlocks only  1.3s) | false alarms 1/13
+
+== test road r157  (train: 29 episodes from ['165', 'normal05', 'r174', 'r180'], test: 3)
+  rule 5s                caught 2/2  delay  5.0s (deadlocks only  5.0s) | false alarms 1/1
+  rule 10s               caught 2/2  delay 10.0s (deadlocks only 10.0s) | false alarms 0/1
+  GRU P>=0.85            caught 2/2  delay  1.5s (deadlocks only  1.5s) | false alarms 1/1
+
+== test road r174  (train: 29 episodes from ['165', 'normal05', 'r157', 'r180'], test: 3)
+  rule 5s                caught 3/3  delay  5.0s (deadlocks only  5.0s) | false alarms 0/0
+  rule 10s               caught 3/3  delay 10.0s (deadlocks only 10.0s) | false alarms 0/0
+  GRU P>=0.85            caught 3/3  delay  1.1s (deadlocks only  1.1s) | false alarms 0/0
+
+== test road r180  (train: 29 episodes from ['165', 'normal05', 'r157', 'r174'], test: 3)
+  rule 5s                caught 3/3  delay  5.0s (deadlocks only  5.0s) | false alarms 0/0
+  rule 10s               caught 3/3  delay 10.0s (deadlocks only 10.0s) | false alarms 0/0
+  GRU P>=0.85            caught 3/3  delay  0.9s (deadlocks only  0.8s) | false alarms 0/0
+
+== ALL FOLDS COMBINED (every road tested only by a model that never saw it)
+  rule 5s                caught 24/24 delay  5.0s (deadlocks only  5.0s) | false alarms 2/14
+  rule 10s               caught 24/24 delay 10.0s (deadlocks only 10.0s) | false alarms 1/14
+  GRU P>=0.85            caught 24/24 delay  1.7s (deadlocks only  1.2s) | false alarms 2/14

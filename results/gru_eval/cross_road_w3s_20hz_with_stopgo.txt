@@ -1,0 +1,36 @@
+Leave-one-road-out (label: stop >= 12 s, no red)
+
+== test road 165  (train: 21 episodes from ['normal05', 'r157', 'r174', 'r180'], test: 22)
+  rule 1s+stopped car    caught 16/16 delay  1.0s (deadlocks only  0.9s) | false alarms 17/27
+  rule 3s+stopped car    caught 16/16 delay  3.0s (deadlocks only  3.0s) | false alarms 11/27
+  rule 5s                caught 16/16 delay  5.0s (deadlocks only  5.0s) | false alarms 8/27
+  rule 10s               caught 16/16 delay 10.0s (deadlocks only 10.0s) | false alarms 1/27
+  GRU P>=0.85            caught 13/16 delay 16.4s (deadlocks only 15.9s) | false alarms 0/27
+
+== test road r157  (train: 38 episodes from ['165', 'normal05', 'r174', 'r180'], test: 5)
+  rule 1s+stopped car    caught 2/2  delay  1.0s (deadlocks only  1.0s) | false alarms 6/7
+  rule 3s+stopped car    caught 2/2  delay  3.0s (deadlocks only  3.0s) | false alarms 6/7
+  rule 5s                caught 2/2  delay  5.0s (deadlocks only  5.0s) | false alarms 4/7
+  rule 10s               caught 2/2  delay 10.0s (deadlocks only 10.0s) | false alarms 0/7
+  GRU P>=0.85            caught 2/2  delay  1.3s (deadlocks only  1.3s) | false alarms 1/7
+
+== test road r174  (train: 38 episodes from ['165', 'normal05', 'r157', 'r180'], test: 5)
+  rule 1s+stopped car    caught 3/3  delay  1.0s (deadlocks only  1.0s) | false alarms 5/5
+  rule 3s+stopped car    caught 3/3  delay  3.0s (deadlocks only  3.0s) | false alarms 5/5
+  rule 5s                caught 3/3  delay  5.0s (deadlocks only  5.0s) | false alarms 3/5
+  rule 10s               caught 3/3  delay 10.0s (deadlocks only 10.0s) | false alarms 0/5
+  GRU P>=0.85            caught 3/3  delay  3.0s (deadlocks only  3.4s) | false alarms 0/5
+
+== test road r180  (train: 38 episodes from ['165', 'normal05', 'r157', 'r174'], test: 5)
+  rule 1s+stopped car    caught 3/3  delay  1.0s (deadlocks only  1.0s) | false alarms 5/5
+  rule 3s+stopped car    caught 3/3  delay  3.0s (deadlocks only  3.0s) | false alarms 4/5
+  rule 5s                caught 3/3  delay  5.0s (deadlocks only  5.0s) | false alarms 2/5
+  rule 10s               caught 3/3  delay 10.0s (deadlocks only 10.0s) | false alarms 0/5
+  GRU P>=0.85            caught 2/3  delay  6.3s (deadlocks only  6.3s) | false alarms 2/5
+
+== ALL FOLDS COMBINED (every road tested only by a model that never saw it)
+  rule 1s+stopped car    caught 24/24 delay  1.0s (deadlocks only  1.0s) | false alarms 33/44
+  rule 3s+stopped car    caught 24/24 delay  3.0s (deadlocks only  3.0s) | false alarms 26/44
+  rule 5s                caught 24/24 delay  5.0s (deadlocks only  5.0s) | false alarms 17/44
+  rule 10s               caught 24/24 delay 10.0s (deadlocks only 10.0s) | false alarms 1/44
+  GRU P>=0.85            caught 20/24 delay 11.8s (deadlocks only 11.6s) | false alarms 3/44

@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
 *.csv
-results/
+!data_sample/*.csv
 *.log.txt
 venv/
