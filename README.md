@@ -110,3 +110,13 @@ venv\Scripts\python.exe tools\final_report.py _final2
 - LLM은 아직 대체 응답기. 실제 LLM이 사진을 보는 단계는 남아 있음
 - 입력이 시뮬레이터의 정확한 정보(PDM-Lite 특권 정보). 실제 센서에서는 신호·비상등·옆 차선 인식이 나빠짐
 - 12초 근처의 애매한 정지가 데이터에 적어 GRU 출력이 0/1로 몰림 (확률 보정 필요)
+
+## LLM 연결 단계 (2026-11-11 추가)
+
+GRU가 고른 정지(또는 낙하물·공사 콘 감지)에서 Gemini(무료 API)가 사진 + 상황 요약을 보고 의도(WAIT / BYPASS / PROCEED, 공사 구간이면 방향)를 정하고,
+안전 규칙이 검증한 뒤 PDM-Lite가 실행한다. GRU는 추가 학습 없이 그대로 사용.
+
+- 확인한 상황: 불법주정차(비상등 / 비상등 없음), 단순 지연(대기열), 밟아도 되는 낙하물, 피해야 하는 낙하물, 공사 구간 화살표 방향 차선 변경
+- 설정·안전 규칙·변경 내역: [`docs/LLM_STAGE_NOTES.md`](docs/LLM_STAGE_NOTES.md)
+- 실행 기록(LLM 입력·답·제어): `results/llm_runs/<실행>/events.jsonl` · LLM에 보낸 사진: `results/llm_photos/`
+- 실행: `$env:GEMINI_API_KEY = "<키>"` 후 `scripts/run_intervene.ps1 <경로> -Llm gemini` (키는 코드·저장소에 없음)

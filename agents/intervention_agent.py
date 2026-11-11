@@ -27,7 +27,7 @@ import carla
 import numpy as np
 
 from recording_agent import RecordingAgent, DT
-from llm_advisor import LLMAdvisor, build_summary
+from llm_advisor import LLMAdvisor, build_summary, input_level
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 
 
@@ -44,6 +44,18 @@ class InterventionAgent(RecordingAgent):
     self._trig_stop = float(env('TRIGGER_STOP_SEC', '10'))
     self._reask = float(env('REASK_SEC', '10'))
     self._max_calls = int(env('MAX_LLM_CALLS', '5'))
+    self._handed_veh = None        # (actor, active_scenarios entry, ego lane id, t) until we left our lane
+    # ---- rules for "the situation changes while the LLM is thinking"
+    self._min_ask = float(env('MIN_ASK_STOP_SEC', '8'))   # no question before this stop time (hazard lights: at once)
+    self._veh_asks = 0             # questions about the CURRENT blockage (reset when it resolves by itself)
+    self._pending_stale = False    # the blockage resolved while the question was pending -> ignore the answer
+    self._resolved_logged = True
+    self._proceed_kmh = float(env('PROCEED_KMH', '20'))
+    self._corr_photo_m = float(env('CORR_PHOTO_M', '20'))
+    self._corr_stay = env('CORR_STAY', '1') == '1'   # after a lane closure stay in the new lane until the next junction   # construction zone: photo + question this close   # drive over debris this slowly (less jolt at the edge)
+    # patience policy: after the LLM was asked at least once, bypass anyway when stopped this long (0 = off)
+    self._patience = float(env('PATIENCE_SEC', '45'))              # two-way road: only the oncoming lane
+    self._patience_multi = float(env('PATIENCE_MULTI_SEC', '20'))  # a free / flowing lane in our direction
     self._backup_gap = float(env('BACKUP_GAP', '7'))
     # safety-net rule used together with the GRU: call anyway after this long behind a stopped car (0 = off)
     self._fallback = float(env('FALLBACK_STOP_SEC', '0'))
@@ -93,12 +105,14 @@ class InterventionAgent(RecordingAgent):
     self._pending_t = None
     self._handled = set()          # actor ids already handed to PDM-Lite
     self._backing_up = None        # (actor, direction, t_start) while reversing
-    self._use_cam = env('LLM_CAMERA', '1' if self._advisor.mode == 'claude' else '0') == '1'
+    self._use_cam = env('LLM_CAMERA', '1' if self._advisor.mode in ('claude', 'gemini') else '0') == '1'
+    self._debris_photo_m = float(env('DEBRIS_PHOTO_M', '12'))   # debris: take the LLM photo this close (far = too small)
     self._snap_cam = None
     self._snap_img = None
     self._snap_wait = None      # (actor, t_started, row) while waiting for the camera frame
     self._p_gru = 0.0
-    self._log('start', trigger=self._trig_mode, llm=self._advisor.mode, trig_stop=self._trig_stop)
+    self._log('start', trigger=self._trig_mode, llm=self._advisor.mode, trig_stop=self._trig_stop,
+              llm_input=input_level(), perception=self._perception)
     print(f'>> [Intervention] trigger={self._trig_mode} llm={self._advisor.mode} -> {self._ev_dir}', flush=True)
 
   # ------------------------------------------------------------------ camera (on demand)
@@ -189,6 +203,42 @@ class InterventionAgent(RecordingAgent):
       last, last_lon = a, lon
     return last
 
+  def _patience_for(self, row):
+    """(seconds to wait before going around anyway, road description) - None = never go around by policy."""
+    if float(row['traffic_light_red']) > 0 or float(row['at_junction']) > 0:
+      return None, 'red light / junction ahead'
+    lk = self._lane_kinds()
+    free_same = []
+    for side in ('left', 'right'):
+      if lk.get(f'{side}_lane_kind') != 'same':
+        continue
+      n = float(row.get(f'{side}_count', 0))
+      v = float(row.get(f'{side}_mean_speed_ms', 0))
+      if n == 0 or v > 3.0:
+        free_same.append(f'{side} lane {"empty" if n == 0 else f"flowing {v:.0f} m/s"}')
+      else:
+        return None, f'{side} lane in our direction is jammed too'
+    if free_same:
+      return self._patience_multi, 'multi-lane road, ' + ', '.join(free_same)
+    return self._patience, 'only the oncoming lane to go around'
+
+  def _do_bypass(self, actor, row, t):
+    # the answer is a few seconds old: if the vehicle has started to move meanwhile, the situation is over
+    v = actor.get_velocity()
+    if (v.x ** 2 + v.y ** 2) ** 0.5 > 0.5:
+      self._log('bypass_skipped', reason='the vehicle started to move while we were waiting for the answer')
+      return
+    dinfo = self._bypass_direction()
+    if dinfo[0] is None:
+      self._log('bypass_impossible', reason='no adjacent driving lane')
+      self._handled.add(actor.id)
+      return
+    if self._backup_gap > 0 and row['front_dist_m'] < self._backup_gap and self._rear_clear():
+      self._backing_up = (actor, dinfo, t)
+      self._log('backup_start', gap_m=row['front_dist_m'], target_gap_m=self._backup_gap)
+    else:
+      self._hand_to_planner(actor, dinfo)
+
   def _hand_to_planner(self, actor, direction_info):
     stype, direction = direction_info
     last = self._stopped_chain_end(actor)
@@ -196,9 +246,62 @@ class InterventionAgent(RecordingAgent):
     data = [actor, None if last.id == actor.id else last, direction, False, 1e9, 1e9, False]
     if last.id != actor.id:
       self._log('obstacle_row', first=actor.id, last=last.id, last_type=last.type_id)
-    CarlaDataProvider.active_scenarios.append((stype, data))
+    entry = (stype, data)
+    CarlaDataProvider.active_scenarios.append(entry)
     self._handled.add(actor.id)
+    try:
+      self._handed_veh = (actor, entry, CarlaDataProvider.get_map().get_waypoint(self._vehicle.get_location()).lane_id,
+                          self._t())
+    except Exception:
+      self._handed_veh = None
     self._log('handed_to_planner', actor=actor.type_id, actor_id=actor.id, scenario_type=stype, direction=direction)
+
+  def _lane_kinds(self):
+    """Does a left / right lane exist next to the ego lane, and which way does it go? (so the LLM is not told
+    '0 vehicles' about a lane that is not there)"""
+    try:
+      wp = CarlaDataProvider.get_map().get_waypoint(self._vehicle.get_location())
+      out = {}
+      for side, l in (('left', wp.get_left_lane()), ('right', wp.get_right_lane())):
+        if l is None or l.lane_type != carla.LaneType.Driving:
+          out[f'{side}_lane_kind'] = 'none'
+        else:
+          out[f'{side}_lane_kind'] = 'same' if l.lane_id * wp.lane_id > 0 else 'opposite'
+      return out
+    except Exception:
+      return {}
+
+  def _check_bypass_abort(self, t):
+    """A vehicle we handed to the planner starts to move before we left our lane -> it was a queue after all.
+    PDM-Lite has already shifted its route into the next lane (and dropped the scenario entry), so we restore
+    the original route ahead: the car stays in its lane and simply follows the vehicle again."""
+    h = self._handed_veh
+    if h is None:
+      return
+    actor, entry, lane_id, t0 = h
+    if not actor.is_alive or t - t0 > 30.0:
+      self._handed_veh = None
+      return
+    ewp = CarlaDataProvider.get_map().get_waypoint(self._vehicle.get_location())
+    if ewp.lane_id != lane_id:              # already changed lanes: finish the manoeuvre normally
+      self._handed_veh = None
+      self._log('bypass_lane_changed', after_s=round(t - t0, 1))
+      return
+    v = actor.get_velocity()
+    if (v.x ** 2 + v.y ** 2) ** 0.5 > 1.0:
+      if entry in CarlaDataProvider.active_scenarios:
+        CarlaDataProvider.active_scenarios.remove(entry)
+      try:
+        wp = self._waypoint_planner
+        ri = wp.route_index
+        wp.route_points[ri:] = wp.original_route_points[ri:]
+        restored = True
+      except Exception as e:
+        restored = f'failed: {e}'
+      self._handled.discard(actor.id)
+      self._handed_veh = None
+      self._log('bypass_aborted', reason='the vehicle started to move before we left our lane -> stay and follow it',
+                after_s=round(t - t0, 1), route_restored=restored)
 
   def _rear_clear(self, need=8.0):
     ego = self._vehicle
@@ -233,7 +336,115 @@ class InterventionAgent(RecordingAgent):
       control = self._intervene(control)
     except Exception as e:  # never break driving because of the intervention layer
       print(f'>> [Intervention] error: {e}', flush=True)
+    try:
+      self._follow_cam()
+      self._ensure_collision_log()
+      self._prop_photos()
+    except Exception as e:
+      print(f'>> [Intervention] watch/photo error: {e}', flush=True)
+    # we changed lanes for good and the evaluated route ends while we are still in the new lane: stop at its end
+    # (the leaderboard counts the route as completed within 10 m; past it PDM-Lite only has extra filler points)
+    end_i = getattr(self, '_lane_moved_end', None)
+    if end_i is not None:
+      try:
+        wpl = self._waypoint_planner
+        left_m = (end_i - wpl.route_index) / wpl.points_per_meter
+        v = self._vehicle.get_velocity()
+        spd = (v.x ** 2 + v.y ** 2) ** 0.5
+        allowed = (2.0 * 3.0 * max(0.0, left_m)) ** 0.5          # 3 m/s^2 stopping profile to the route end
+        if spd > allowed + 0.3:
+          control = carla.VehicleControl(throttle=0.0, brake=min(1.0, 0.3 + 0.25 * (spd - allowed)), steer=control.steer)
+        if left_m <= 0.5:
+          control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=control.steer)
+      except Exception:
+        pass
+    # SPEED_CAP_KMH (0 = off): keep the car slow, e.g. for the prop tests so you can watch the contact
+    cap = float(os.environ.get('SPEED_CAP_KMH', '0') or 0)
+    if cap > 0:
+      v = self._vehicle.get_velocity()
+      kmh = 3.6 * (v.x ** 2 + v.y ** 2) ** 0.5
+      if kmh > cap:
+        control.throttle = 0.0
+        control.brake = max(control.brake, min(0.5, 0.1 * (kmh - cap)))
+      elif kmh > cap - 3.0:
+        control.throttle = min(control.throttle, 0.3)
     return control
+
+  # ------------------------------------------------------------------ watching + collision log
+  def _follow_cam(self):
+    """FOLLOW_CAM=driver (default): the CARLA window looks through the windscreen of our car.
+    FOLLOW_CAM=chase: from behind and above. FOLLOW_CAM=0: leave the window camera alone."""
+    mode = os.environ.get('FOLLOW_CAM', 'driver').lower()
+    if mode in ('0', 'off', 'none'):
+      return
+    tf = self._vehicle.get_transform()
+    f, r = tf.get_forward_vector(), tf.get_right_vector()
+    if mode == 'chase':
+      loc = tf.location - carla.Location(x=f.x * 9.0 + r.x * 2.0, y=f.y * 9.0 + r.y * 2.0, z=-4.0)
+      rot = carla.Rotation(pitch=-15.0, yaw=tf.rotation.yaw + 10.0)
+    else:
+      loc = tf.location + carla.Location(x=f.x * 1.0, y=f.y * 1.0, z=1.8)
+      rot = carla.Rotation(pitch=tf.rotation.pitch - 8.0, yaw=tf.rotation.yaw)
+    CarlaDataProvider.get_world().get_spectator().set_transform(carla.Transform(loc, rot))
+
+  def _prop_photos(self):
+    """PROP_PHOTOS=1: photos of the object in our lane from the LLM camera at 40 / 20 / 10 / 5 m
+    (photo_d40.jpg ... in the run's events folder). Uses the same on-demand camera as the LLM call."""
+    if os.environ.get('PROP_PHOTOS', '0') != '1':
+      return
+    st = getattr(self, '_photo', None)
+    if st is None:
+      st = self._photo = {'todo': [40, 20, 10, 5], 'busy': None}
+    if st['busy'] is not None:                   # waiting for the frame of a started snapshot
+      d, t0 = st['busy']
+      if self._snap_img is None and self._t() - t0 < 2.0:
+        return
+      if self._snap_img is not None:
+        jpg = self._jpeg()
+        with open(os.path.join(self._ev_dir, f'photo_d{d}.jpg'), 'wb') as f:
+          f.write(jpg)
+        hit = self._scan_debris()
+        self._log('photo', target_m=d, gap_m=round(hit[0], 1) if hit else None,
+                  obj=hit[2].type_id if hit else None, file=f'photo_d{d}.jpg')
+      self._stop_snapshot()
+      st['busy'] = None
+      return
+    if not st['todo'] or self._snap_wait is not None:
+      return
+    hit = self._scan_debris()
+    if hit is None:
+      return
+    gap = hit[0] + self._vehicle.bounding_box.extent.x - 0.8     # camera (0.8 m ahead of centre) to object centre-ish
+    while st['todo'] and gap < st['todo'][0] - 3.0:              # already too close for this one: skip it
+      st['todo'].pop(0)
+    if st['todo'] and gap <= st['todo'][0]:
+      d = st['todo'].pop(0)
+      self._start_snapshot()
+      st['busy'] = (d, self._t())
+
+  def _ensure_collision_log(self):
+    """Our own collision sensor -> 'collision' events in events.jsonl (survives an early MAX_STOP exit,
+    which skips the leaderboard's own record)."""
+    if getattr(self, '_col_sensor', None) is not None:
+      return
+    world = CarlaDataProvider.get_world()
+    self._col_sensor = world.spawn_actor(world.get_blueprint_library().find('sensor.other.collision'),
+                                         carla.Transform(), attach_to=self._vehicle)
+    self._col_seen = {}
+
+    def on_col(ev):
+      oid = ev.other_actor.id
+      imp = (ev.normal_impulse.x ** 2 + ev.normal_impulse.y ** 2 + ev.normal_impulse.z ** 2) ** 0.5
+      prev = self._col_seen.get(oid)
+      if prev is None or imp > prev * 1.5:     # first touch of this object, or a much harder hit
+        self._col_seen[oid] = imp
+        try:
+          v = self._vehicle.get_velocity()
+          self._log('collision', other=ev.other_actor.type_id, other_id=oid, impulse=round(imp, 1),
+                    speed_kmh=round(3.6 * (v.x ** 2 + v.y ** 2) ** 0.5, 1))
+        except Exception:
+          pass
+    self._col_sensor.listen(on_col)
 
   def _intervene(self, control):
     row = self._last_row
@@ -241,6 +452,7 @@ class InterventionAgent(RecordingAgent):
       return control
     t = self._t()
     fire = self._trigger(row)     # evaluated every tick so the GRU sees a continuous stream
+    self._check_bypass_abort(t)
 
     # ---- executing a back-up manoeuvre before the bypass
     if self._backing_up is not None:
@@ -258,12 +470,16 @@ class InterventionAgent(RecordingAgent):
     if self._snap_wait is not None:
       actor, t0, kind = self._snap_wait
       if self._snap_img is None and t - t0 < 2.0:
-        return self._debris_brake(control) if kind == 'debris' else control
+        return self._debris_brake(control) if kind == 'debris' else (
+            self._approach_brake(control, self._corr_gap()) if kind == 'corridor' and self._corr else control)
       self._stop_snapshot()
       self._snap_wait = None
       if kind == 'debris':
         self._ask_debris(actor, row, t)
         return self._debris_brake(control)
+      if kind == 'corridor':
+        self._ask_corridor(row, t)
+        return control
       self._ask(actor, row, t)
       return control
 
@@ -279,7 +495,26 @@ class InterventionAgent(RecordingAgent):
       if out is not None:
         return out
 
-    # ---- waiting for an LLM answer
+    # ---- the blockage resolved by itself (front vehicle drives off, or we are rolling again) -> back to normal
+    fa = self._pending_actor or self._last_front_actor
+    bypassing = self._pending_actor is None and self._handed_veh is not None
+    if (self._veh_asks > 0 or self._pending_actor is not None) and bypassing:
+      self._veh_asks = 0                 # we decided to go around it: not a "resolved by itself" case
+    elif self._veh_asks > 0 or self._pending_actor is not None:
+      fv = fa.get_velocity() if (fa is not None and fa.is_alive) else None
+      front_moving = fv is None or (fv.x ** 2 + fv.y ** 2) ** 0.5 > 1.0
+      ego_moving = float(row['ego_speed_kmh']) > 7.0
+      if front_moving or ego_moving:
+        if self._pending_actor is not None:
+          self._pending_stale = True
+        if not self._resolved_logged:
+          self._log('situation_resolved', reason=('front vehicle is gone' if fv is None else 'front vehicle drives off')
+                    if front_moving else 'ego is moving again',
+                    asks=self._veh_asks, pending=self._pending_actor is not None)
+          self._resolved_logged = True
+        self._veh_asks = 0
+
+    # ---- waiting for an LLM answer (PDM-Lite keeps driving meanwhile: it follows the front vehicle if it moves)
     if self._pending_actor is not None:
       res = self._advisor.poll()
       if res is None:
@@ -287,19 +522,31 @@ class InterventionAgent(RecordingAgent):
       actor = self._pending_actor
       self._pending_actor = None
       self._last_ask_t = t
+      stale = self._pending_stale
+      self._pending_stale = False
+      if stale:
+        res['discarded'] = 'the blockage resolved while the LLM was thinking -> answer ignored, normal driving'
       self._log('llm_answer', sim_wait_s=round(t - self._pending_t, 2), **res)
-      if res['decision'] == 'BYPASS' and actor.is_alive:
-        dinfo = self._bypass_direction()
-        if dinfo[0] is None:
-          self._log('bypass_impossible', reason='no adjacent driving lane')
-          self._handled.add(actor.id)
-          return control
-        if self._backup_gap > 0 and row['front_dist_m'] < self._backup_gap and self._rear_clear():
-          self._backing_up = (actor, dinfo, t)
-          self._log('backup_start', gap_m=row['front_dist_m'], target_gap_m=self._backup_gap)
-        else:
-          self._hand_to_planner(actor, dinfo)
+      if res['decision'] == 'BYPASS' and actor.is_alive and not stale:
+        self._do_bypass(actor, row, t)
       return control
+
+    # ---- patience policy: the LLM kept saying WAIT, but we have waited long enough and nothing moves.
+    # How long depends on the road: next to a FREE / FLOWING lane in our direction a lane change is everyday driving
+    # (PATIENCE_MULTI_SEC, 20 s); with only the oncoming lane to go around we wait longer (PATIENCE_SEC, 45 s);
+    # with a red light / junction ahead or the neighbour lane jammed as well we do not go around at all.
+    if (self._patience > 0 and self._veh_asks > 0 and self._pending_actor is None and self._snap_wait is None
+        and self._backing_up is None):
+      pa = self._last_front_actor
+      if (pa is not None and pa.is_alive and pa.id not in self._handled
+          and float(row['front_speed_ms']) < 0.3
+          and not (float(row['front2_dist_m']) < 900 and float(row['front2_speed_ms']) > 0.5)):
+        patience, road = self._patience_for(row)
+        if patience is not None and float(row['stop_duration_s']) >= patience:
+          self._log('policy_bypass', reason=f'stopped {float(row["stop_duration_s"]):.0f} s >= {patience:.0f} s '
+                    f'({road}), nothing ahead moves', llm_calls=self._veh_asks)
+          self._do_bypass(pa, row, t)
+          return control
 
     # ---- trigger
     if not fire:
@@ -307,10 +554,16 @@ class InterventionAgent(RecordingAgent):
     actor = self._last_front_actor
     if actor is None or actor.id in self._handled:
       return control
-    if t - self._last_ask_t < self._reask or self._calls >= self._max_calls:
+    if t - self._last_ask_t < self._reask or self._veh_asks >= self._max_calls:
+      return control
+    # GRU says "this stop is unusual" - but a question needs something to judge: wait MIN_ASK_STOP_SEC first
+    # (hazard lights are a clear cue -> ask at once)
+    if float(row['front_hazard_on']) <= 0 and float(row['stop_duration_s']) < self._min_ask:
       return control
 
     self._calls += 1
+    self._veh_asks += 1
+    self._resolved_logged = False
     if self._use_cam:
       try:
         self._start_snapshot()
@@ -327,12 +580,13 @@ class InterventionAgent(RecordingAgent):
     if jpeg:
       with open(os.path.join(self._ev_dir, img_name), 'wb') as f:
         f.write(jpeg)
-    summary = build_summary(row)
+    summary = build_summary({**row, **self._lane_kinds()})
     self._log('trigger', call=self._calls, by=self._fired_by, stop_s=row['stop_duration_s'], p_gru=round(self._p_gru, 3),
               front=actor.type_id, front_id=actor.id, image=img_name if jpeg else None, summary=summary)
     self._pending_actor = actor
     self._pending_t = t
     self._advisor.request(jpeg, summary, dict(row))
+    self._snap_img = None
 
   # ------------------------------------------------------------------ fallen objects
   def _scan_debris(self):
@@ -343,8 +597,8 @@ class InterventionAgent(RecordingAgent):
     ewp = cmap.get_waypoint(tf.location)
     best = None
     for a in world.get_actors().filter('static.prop.*'):
-      if a.id in self._debris_done or 'cone' in a.type_id:
-        continue                         # cones are handled as a construction zone (_corridor_step)
+      if a.id in self._debris_done or any(k in a.type_id for k in ('cone', 'warning', 'barrier')):
+        continue                         # cones / signs / barriers belong to a construction zone (_corridor_step)
       lon, lat = self._ego_frame(tf, a.get_location())
       rng = self._debris_range
       if self._perception == 'noisy':
@@ -556,7 +810,8 @@ class InterventionAgent(RecordingAgent):
       if abs(lat) < 8.0:
         pts.append((float(k), lat, c))
     half_w = self._vehicle.bounding_box.extent.y
-    blocking = [p for p in pts if abs(p[1]) < half_w + 0.5]
+    lw0 = refs[0].lane_width
+    blocking = [p for p in pts if abs(p[1]) < max(half_w + 0.5, lw0 / 2.0 - 0.05)]   # any cone inside our lane
     if len(blocking) < 2:
       return None                       # cones beside the road, our lane is free
     s0 = min(p[0] for p in blocking)
@@ -564,10 +819,33 @@ class InterventionAgent(RecordingAgent):
     s1 = max(p[0] for p in zone)
     lw = refs[0].lane_width
     left = refs[0].get_left_lane()
+    right = refs[0].get_right_lane()
     has_opp = left is not None and left.lane_type == carla.LaneType.Driving
+    has_right = (right is not None and right.lane_type == carla.LaneType.Driving
+                 and right.lane_id * refs[0].lane_id > 0)
     road_left = -lw / 2.0 - (left.lane_width if has_opp else 0.0)
-    bounds = sorted([road_left, lw / 2.0] + [p[1] for p in zone])
-    lo, hi = max(zip(bounds[:-1], bounds[1:]), key=lambda b: b[1] - b[0])
+    road_right = lw / 2.0 + (right.lane_width if has_right else 0.0)
+    bounds = sorted([road_left, road_right] + [p[1] for p in zone])
+    gaps = list(zip(bounds[:-1], bounds[1:]))
+    # keep to our own lane if a wide-enough gap exists there (crossing the centre line only when necessary)
+    need = 2.0 * half_w + 0.6 + 0.4
+    own = [g for g in gaps if g[0] >= -lw / 2.0 - 0.05 and g[1] <= lw / 2.0 + 0.05 and g[1] - g[0] >= need]
+    lo, hi = max(own or gaps, key=lambda b: b[1] - b[0])
+    # every passable corridor, best one per side (left / center / right of our lane centre): the LLM picks the side
+    options, opp_only = {}, {}
+    opp_left = has_opp and not self._left_same(refs[0])        # the lane on our left is ONCOMING traffic
+    for g0, g1 in gaps:
+      if g1 - g0 < need:
+        continue
+      c = (g0 + g1) / 2.0
+      side = 'left' if c < -0.6 else ('right' if c > 0.6 else 'center')
+      uses_opp = opp_left and g0 < -lw / 2.0 - 0.3                # the car would have to drive in the oncoming lane
+      bucket = opp_only if uses_opp else options
+      if side not in bucket or (g1 - g0) > bucket[side][1]:
+        bucket[side] = (c, g1 - g0 - 0.4)
+    # the oncoming lane is a way through ONLY when there is no way in our own direction
+    if not options:
+      options = opp_only
     width = (hi - lo) - 0.4               # cone radius on both sides
     first = min(zone, key=lambda p: p[0])[2]
     last = max(zone, key=lambda p: p[0])[2]
@@ -575,7 +853,13 @@ class InterventionAgent(RecordingAgent):
     return dict(first=first, last=last, cones=[p[2] for p in zone], n=len(zone), s0=s0, length=s1 - s0,
                 width=width, center=(lo + hi) / 2.0, centre_line=-lw / 2.0, lane_w=lw,
                 gap=lon_first - self._vehicle.bounding_box.extent.x,
-                on_centre_line=lo < -lw / 2.0 < hi, uses_opposite=lo < -lw / 2.0)
+                on_centre_line=lo < -lw / 2.0 < hi, uses_opposite=lo < -lw / 2.0 and not self._left_same(refs[0]),
+                options=options)
+
+  @staticmethod
+  def _left_same(wp):
+    l = wp.get_left_lane()
+    return l is not None and l.lane_type == carla.LaneType.Driving and l.lane_id * wp.lane_id > 0
 
   def _oncoming(self, lane_w):
     """Opposite-direction vehicles ahead on our road -> (count within 80 m, nearest distance)"""
@@ -595,8 +879,16 @@ class InterventionAgent(RecordingAgent):
       near = min(near, lon)
     return n, near
 
-  def _approach_brake(self, control, gap, stop_at=5.0):
-    """Approach smoothly (2.5 m/s^2 profile) and stop stop_at metres before a point."""
+  def _corr_gap(self):
+    first = self._corr['g']['first']
+    lon, _ = self._ego_frame(self._vehicle.get_transform(), first.get_location())
+    return lon - self._vehicle.bounding_box.extent.x
+
+  def _approach_brake(self, control, gap, stop_at=None):
+    """Approach smoothly (2.5 m/s^2 profile) and stop stop_at metres before a point. Construction zones: stop
+    CORR_STOP_M (9 m) before the first cone, so a lane change from standstill has room for a smooth curve."""
+    if stop_at is None:
+      stop_at = float(os.environ.get('CORR_STOP_M', '9'))
     if gap < stop_at:
       return carla.VehicleControl(throttle=0.0, brake=1.0, steer=control.steer)
     allowed = (2.0 * 2.5 * (gap - stop_at)) ** 0.5
@@ -605,6 +897,93 @@ class InterventionAgent(RecordingAgent):
     if speed > allowed + 0.5:
       return carla.VehicleControl(throttle=0.0, brake=min(1.0, 0.3 + 0.2 * (speed - allowed)), steer=control.steer)
     return control
+
+  def _dist_to_junction(self, loc, max_m=300.0, margin_m=25.0):
+    """Route metres from loc to `margin_m` before the next junction (where a route-needed lane change happens)."""
+    wp = self._waypoint_planner
+    ppm = wp.points_per_meter
+    i = wp.get_closest_route_index(wp.route_index, loc)
+    end = min(len(wp.route_waypoints) - 1, i + int(max_m * ppm))
+    # never past the END of the evaluated route: PDM-Lite appends 50 m of extra points there, and the leaderboard
+    # only counts the route as completed when we are back on it -> come back before the last route point
+    try:
+      last = self._global_plan_world_coord[-1][0].location
+      i_end = wp.get_closest_route_index(i, last)
+      end = min(end, i_end - int(12.0 * ppm))         # leave room for the 12 m ramp back
+    except Exception:
+      pass
+    for k in range(i, max(i, end)):
+      try:
+        if wp.route_waypoints[k].is_junction:
+          return max(4.0, (k - i) / ppm - margin_m)
+      except Exception:
+        break
+    return max(4.0, (end - i) / ppm - 10.0)
+
+  def _move_to_lane(self, first_loc, side, ramp_m=12.0, pre_m=4.0):
+    """Lane closure -> change into the neighbouring same-direction lane for good: from shortly before the first
+    cone the route follows the CENTRE OF THAT LANE (taken from the map, so curves are followed correctly) for as
+    long as that lane exists next to the original route lane. Only where it ends (junction, lane drop) does the
+    route ramp back - exactly where the route itself needs the original lane."""
+    wp = self._waypoint_planner
+    ppm = wp.points_per_meter
+    orig = wp.original_route_points
+    i0 = wp.get_closest_route_index(wp.route_index, first_loc)
+    ramp, pre = int(ramp_m * ppm), int(pre_m * ppm)
+    a = max(wp.route_index, i0 - pre - ramp)
+    n = min(len(wp.route_points), len(wp.route_waypoints))
+    # follow the CENTRE of the lane we moved into, step by step: at every route point take the lane centre (route
+    # lane or one of its neighbours) that continues the previous target point. This stays correct even where the
+    # route itself changes lanes later (the old "route + fixed sideways offset" then went one lane too far).
+    targets, k_end, why, prev = {}, n, 'end of route points', None
+    for idx in range(a, n):
+      base = wp.route_waypoints[idx]
+      if base.is_junction:
+        k_end, why = idx, 'junction'
+        break
+      if prev is None:
+        nb = base.get_left_lane() if side == 'left' else base.get_right_lane()
+        if nb is None or nb.lane_type != carla.LaneType.Driving or nb.lane_id * base.lane_id <= 0:
+          k_end, why = idx, 'no neighbour lane'
+          break
+        cand_best = nb
+      else:
+        pred = prev + (orig[idx, :2] - orig[idx - 1, :2])        # keep going along the road
+        cands = [base, base.get_left_lane(), base.get_right_lane()]
+        cand_best, dmin = None, 1e9
+        for c in cands:
+          if c is None or c.lane_type != carla.LaneType.Driving or c.lane_id * base.lane_id <= 0:
+            continue
+          dd = float(np.hypot(c.transform.location.x - pred[0], c.transform.location.y - pred[1]))
+          if dd < dmin:
+            cand_best, dmin = c, dd
+        if cand_best is None or dmin > 1.5:
+          k_end, why = idx, 'our new lane ends / bends away'
+          break
+      # the lane centre itself (same position along the road as the route point) - no drift, no double offset
+      t = np.array([cand_best.transform.location.x, cand_best.transform.location.y])
+      targets[idx] = t
+      prev = t
+    for idx in range(a, k_end):
+      if idx < i0 - pre:
+        f = (idx - (i0 - pre - ramp)) / ramp
+      elif k_end < n and idx > k_end - ramp:
+        f = (k_end - idx) / ramp
+      else:
+        f = 1.0
+      f = min(1.0, max(0.0, f))
+      f = f * f * (3.0 - 2.0 * f)
+      wp.route_points[idx, :2] = orig[idx, :2] * (1.0 - f) + targets[idx] * f
+    # end of the evaluated route = our route points minus the filler PDM-Lite appended behind it
+    # (a nearest-point search for the last route position can stop early on a long route)
+    try:
+      i_last = len(orig) - 1 - int(wp.extra_route_length * ppm)
+    except Exception:
+      i_last = -1
+    self._lane_moved_end = i_last if (i_last > 0 and k_end > i_last) else None
+    self._log('lane_move', side=side, from_idx=int(a), until_idx=int(k_end), route_end_idx=int(i_last),
+              keep_m=round((k_end - i0) / ppm, 1), ends_because=why)
+    return i0, k_end, (k_end - i0) / ppm
 
   def _shift_route(self, first_loc, last_loc, offset, ramp_m=12.0, pre_m=4.0, post_m=4.0):
     """Move PDM-Lite's route sideways by `offset` m (+ right / - left) from shortly before the first cone to
@@ -637,7 +1016,7 @@ class InterventionAgent(RecordingAgent):
 
   def _corridor_summary(self, g, onc_n, onc_d):
     return (f"construction zone ahead: {g['n']} traffic cones over {g['length']:.0f} m, starting {g['gap']:.0f} m ahead. "
-            f"Cones stand inside our lane, so our lane is blocked.\n"
+            f"Cones stand inside our lane.\n"
             f"free corridor between the cone lines: {g['width']:.1f} m wide, its centre is "
             f"{abs(g['center']):.1f} m to the {'left' if g['center'] < 0 else 'right'} of our lane centre"
             f"{' (on the centre line, partly in the opposite lane)' if g['on_centre_line'] else ''}; "
@@ -649,15 +1028,29 @@ class InterventionAgent(RecordingAgent):
     g = self._scan_cones() or st['g']
     st['g'] = g
     onc_n, onc_d = self._oncoming(g['lane_w'])
-    summary = self._corridor_summary(g, onc_n, onc_d) + build_summary(row)
+    if input_level() == 'photo':          # what the zone looks like and whether there is a way through: from the photo
+      head = (f"construction zone ahead: traffic cones stand in or along our lane, starting about {g['gap']:.0f} m "
+              f"ahead. Corridor width and oncoming traffic were NOT measured - judge from the photo whether and where "
+              f"a car can pass.\n")
+    else:
+      head = self._corridor_summary(g, onc_n, onc_d)
+    summary = head + build_summary({**row, **self._lane_kinds()})
+    jpeg = self._jpeg()
+    img_name = f'call{self._calls + 1}_corridor_t{t:.1f}.jpg'
+    if jpeg:
+      with open(os.path.join(self._ev_dir, img_name), 'wb') as f:
+        f.write(jpeg)
     drow = dict(row)
     drow.update(kind='corridor', corr_width=g['width'], corr_center=g['center'], ego_width=2 * self._vehicle.bounding_box.extent.y,
+                corr_options={k: round(v[0], 2) for k, v in g.get('options', {}).items()},
                 oncoming_n=onc_n, oncoming_dist=onc_d)
     self._calls += 1
     self._log('trigger', call=self._calls, by='cones_detected', kind='corridor', n_cones=g['n'], gap_m=round(g['gap'], 1),
-              corridor_width_m=round(g['width'], 2), corridor_center_m=round(g['center'], 2), oncoming=onc_n, summary=summary)
+              corridor_width_m=round(g['width'], 2), corridor_center_m=round(g['center'], 2), oncoming=onc_n,
+              image=img_name if jpeg else None, summary=summary)
     st['t'] = t
-    self._advisor.request(self._jpeg(), summary, drow)
+    self._advisor.request(jpeg, summary, drow)
+    self._snap_img = None
 
   def _corridor_step(self, control, row, t):
     st = self._corr
@@ -669,6 +1062,9 @@ class InterventionAgent(RecordingAgent):
         return None
       self._corr = st = {'g': g, 'phase': 'asking', 't_seen': t, 'stop_s': 0.0, 'min_clear': 99.0}
       self._log('cones_seen', n=g['n'], gap_m=round(g['gap'], 1), width_m=round(g['width'], 2), center_m=round(g['center'], 2))
+      if self._use_cam:
+        st['phase'] = 'photo_approach'     # slow down first; ask with a photo taken within CORR_PHOTO_M
+        return self._approach_brake(control, g['gap'])
       self._ask_corridor(row, t)
       return self._approach_brake(control, g['gap'])
 
@@ -685,21 +1081,67 @@ class InterventionAgent(RecordingAgent):
     lon_last, _ = self._ego_frame(tf, g['last'].get_location())
     gap = lon_first - self._vehicle.bounding_box.extent.x
 
+    if st['phase'] == 'photo_approach':
+      if gap <= self._corr_photo_m or speed < 0.3:
+        st['phase'] = 'asking'
+        st['t'] = t
+        try:
+          self._start_snapshot()
+          self._snap_wait = (g['first'], t, 'corridor')
+        except Exception as ex:
+          print(f'>> [Intervention] camera spawn failed ({ex}) -> text only', flush=True)
+          self._ask_corridor(row, t)
+      return self._approach_brake(control, gap)
     if st['phase'] == 'asking':
+      if self._snap_wait is not None:    # question not sent yet (waiting for the camera frame)
+        return self._approach_brake(control, gap)
       res = self._advisor.poll()
       if res is None:
         return self._approach_brake(control, gap)
       self._log('llm_answer', kind='corridor', sim_wait_s=round(t - st['t'], 2), gap_m=round(gap, 1), **res)
       if res['decision'] in ('BYPASS', 'PROCEED'):
-        i0, i1 = self._shift_route(g['first'].get_location(), g['last'].get_location(), g['center'])
-        self._log('route_shifted', offset_m=round(g['center'], 2), route_idx=[int(i0), int(i1)])
+        opts = g.get('options', {})
+        side = str(res.get('path', '')).lower()
+        offset = opts[side][0] if side in opts else g['center']
+        post, stay = 4.0, False
+        if self._corr_stay and abs(offset) > 2.0:
+          # moved into a whole other lane: if it runs in our direction, stay there (no extra lane change)
+          ewp = CarlaDataProvider.get_map().get_waypoint(self._vehicle.get_location())
+          nb = ewp.get_left_lane() if offset < 0 else ewp.get_right_lane()
+          stay = nb is not None and nb.lane_type == carla.LaneType.Driving and nb.lane_id * ewp.lane_id > 0
+        # sanity check: the cone zone must map onto our route over (roughly) its real length, otherwise the shifted
+        # piece of route would be too short and the car would steer back into the cones
+        wpl = self._waypoint_planner
+        j0 = wpl.get_closest_route_index(wpl.route_index, g['first'].get_location())
+        j1 = wpl.get_closest_route_index(j0, g['last'].get_location())
+        if (j1 - j0) / wpl.points_per_meter < 0.6 * max(g['length'], 5.0):
+          self._log('route_mismatch', reason='the cone zone does not lie along our route -> no lane change, stop',
+                    zone_m=round(g['length'], 1), route_m=round((j1 - j0) / wpl.points_per_meter, 1))
+          st['phase'], st['t_wait'] = 'stuck', t
+          return self._approach_brake(control, gap)
+        if stay:
+          i0, i1, post = self._move_to_lane(g['first'].get_location(), 'left' if offset < 0 else 'right')
+        else:
+          i0, i1 = self._shift_route(g['first'].get_location(), g['last'].get_location(), offset, post_m=post)
+        self._log('route_shifted', offset_m=round(offset, 2), side=side or 'measured', stay_in_new_lane=stay,
+                  keep_m=round(post, 0), route_idx=[int(i0), int(i1)])
         st['phase'] = 'go'
         return None
       st['phase'], st['t_wait'] = 'wait', t
       return self._approach_brake(control, gap)
+    if st['phase'] == 'stuck':
+      return self._approach_brake(control, gap)
     if st['phase'] == 'wait':
       if t - st['t_wait'] >= 3.0 and self._calls < self._max_calls:
         st['phase'] = 'asking'
+        st['t'] = t
+        if self._use_cam:                 # a NEW photo for every question (we are closer now)
+          try:
+            self._start_snapshot()
+            self._snap_wait = (g['first'], t, 'corridor')
+            return self._approach_brake(control, gap)
+          except Exception as ex:
+            print(f'>> [Intervention] camera spawn failed ({ex}) -> text only', flush=True)
         self._ask_corridor(row, t)
       return self._approach_brake(control, gap)
     if st['phase'] == 'go':
@@ -759,17 +1201,23 @@ class InterventionAgent(RecordingAgent):
       with open(os.path.join(self._ev_dir, img_name), 'wb') as f:
         f.write(jpeg)
     approx = 'about ' if self._perception == 'noisy' else ''
-    summary = (f"object lying on the road in the ego lane: {name} "
-               f"(a static object, not a vehicle), {approx}{L:.2f} x {W:.2f} m, height {approx}{H:.2f} m, "
-               f"{approx}{gap:.1f} m ahead\n")
+    no_size = input_level() == 'photo'
+    if no_size:                                         # LLM_INPUT=photo: what it is and how big -> from the photo
+      summary = (f"object lying on the road in the ego lane: {name} (a static object, not a vehicle), "
+                 f"size not measured, {approx}{gap:.1f} m ahead\n")
+    else:
+      summary = (f"object lying on the road in the ego lane: {name} "
+                 f"(a static object, not a vehicle), {approx}{L:.2f} x {W:.2f} m, height {approx}{H:.2f} m, "
+                 f"{approx}{gap:.1f} m ahead\n")
     side, n, near, busy = self._adjacent_traffic(row)
     if side is None:
       summary += "no adjacent lane to go around\n"
     else:
       summary += (f"{side} lane (the one a bypass would use): {n} vehicles nearby, closest {near:+.0f} m "
                   f"-> {'BUSY, changing lanes is risky' if busy else 'free'}\n")
-    summary += build_summary(row)
+    summary += build_summary({**row, **self._lane_kinds()})
     drow = dict(row)
+    # the size is always measured and always goes to the SAFETY RULES; LLM_INPUT=photo only hides it from the LLM
     drow.update(kind='debris', obj_type=name, obj_h=H, obj_w=W, obj_l=L, adj_busy=busy, adj_count=n,
                 adj_possible=side is not None)
     self._log('trigger', call=self._calls, by='debris_detected', kind='debris', perception=self._perception,
@@ -777,6 +1225,7 @@ class InterventionAgent(RecordingAgent):
               image=img_name if jpeg else None, summary=summary)
     self._debris_state['t'] = t
     self._advisor.request(jpeg, summary, drow)
+    self._snap_img = None
 
   def _debris_step(self, control, row, t):
     """Returns a control to use, or None to let the normal (vehicle) logic run."""
@@ -805,12 +1254,8 @@ class InterventionAgent(RecordingAgent):
         return self._start_bypass(a, dinfo, control, t)
       self._calls += 1
       if self._use_cam:
-        try:
-          self._start_snapshot()
-          self._snap_wait = (a, t, 'debris')
-          return self._debris_brake(control)
-        except Exception as ex:
-          print(f'>> [Intervention] camera spawn failed ({ex}) -> text only', flush=True)
+        st['phase'] = 'photo_approach'     # slow down first; the photo is taken within DEBRIS_PHOTO_M
+        return self._debris_brake(control)
       self._ask_debris(a, row, t)
       return self._debris_brake(control)
 
@@ -821,6 +1266,17 @@ class InterventionAgent(RecordingAgent):
     self._debris_metrics_tick()
     gap = self._debris_gap(a)
     if st['phase'] == 'stuck':
+      return self._debris_brake(control)
+    if st['phase'] == 'photo_approach':
+      v = self._vehicle.get_velocity()
+      if gap <= self._debris_photo_m or (v.x ** 2 + v.y ** 2) ** 0.5 < 0.3:
+        st['phase'] = 'asking'
+        try:
+          self._start_snapshot()
+          self._snap_wait = (a, t, 'debris')
+        except Exception as ex:
+          print(f'>> [Intervention] camera spawn failed ({ex}) -> text only', flush=True)
+          self._ask_debris(a, row, t)
       return self._debris_brake(control)
     if st['phase'] == 'merge_wait':
       ok, why = self._merge_clear(st['direction'], st.get('merge_wait_s', 0.0) + (t - st['t_merge']))
@@ -858,6 +1314,18 @@ class InterventionAgent(RecordingAgent):
             self._log('merge_hold', why=why, gap_to_object_m=round(gap, 1))
           return self._debris_brake(control)    # approach smoothly and wait ~5 m before the object
     if st['phase'] in ('proceed', 'bypass'):
+      if st['phase'] == 'proceed' and -6.0 < gap < 12.0 and self._proceed_kmh > 0:
+        v = self._vehicle.get_velocity()
+        kmh = 3.6 * (v.x ** 2 + v.y ** 2) ** 0.5
+        if kmh > self._proceed_kmh:
+          control = carla.VehicleControl(throttle=0.0, brake=min(0.6, 0.1 * (kmh - self._proceed_kmh)),
+                                         steer=control.steer)
+        elif kmh < 10.0 and gap > -3.0:
+          # enough momentum to roll over the edge (CARLA props are fixed bodies: at 3-4 km/h the wheel stops at the
+          # 2 cm edge, the car rolls back and tries again and again)
+          control.throttle = max(control.throttle, 0.6)
+          control.brake = 0.0
+        return control
       if gap < -8.0:                       # object is behind us -> done
         m = st.get('m', {})
         self._log('debris_passed', actor=a.type_id, decision=st['phase'], policy=self._debris_policy,
@@ -892,12 +1360,25 @@ class InterventionAgent(RecordingAgent):
       if t - st['t_wait'] >= self._reask and self._calls < self._max_calls:
         self._calls += 1
         st['phase'] = 'asking'
+        if self._use_cam:                 # a NEW photo for every question
+          try:
+            self._start_snapshot()
+            self._snap_wait = (a, t, 'debris')
+            return self._debris_brake(control)
+          except Exception as ex:
+            print(f'>> [Intervention] camera spawn failed ({ex}) -> text only', flush=True)
         self._ask_debris(a, row, t)
       return self._debris_brake(control)
     return None
 
   def destroy(self, results=None):
     self._stop_snapshot()
+    try:
+      if getattr(self, '_col_sensor', None) is not None:
+        self._col_sensor.stop()
+        self._col_sensor.destroy()
+    except Exception:
+      pass
     try:
       self._log('end', calls=self._calls, handed=len(self._handled))
       self._ev_file.close()

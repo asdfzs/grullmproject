@@ -1,0 +1,24 @@
+key OK. flash models: gemini-2.5-flash, gemini-2.5-flash-preview-tts, gemini-flash-latest, gemini-flash-lite-latest, gemini-2.5-flash-lite, gemini-2.5-flash-image, gemini-3-flash-preview, gemini-3.1-flash-lite-preview, gemini-3.1-flash-lite, gemini-3.1-flash-image-preview, gemini-3.1-flash-image, gemini-3.1-flash-lite-image, gemini-3.5-flash, gemini-3.5-flash-lite, gemini-omni-flash-preview
+using model: gemini-3.1-flash-lite  (change with $env:LLM_MODEL = "<name from the list>")
+
+== photo-only test (no name, no size given) ==
+prop               expected  gemini   conf  sec   reason
+ironplank          PROCEED   OK PROCEED 0.90   5.1  [gemini] The object appears to be a flat piece of debris or cardboard that does not pose a risk to the vehicle's underc
+creasedbox03       PROCEED   OK PROCEED 0.95   5.0  [gemini] The object appears to be a flat piece of cardboard or paper which poses no risk to the vehicle and can be safe
+creasedbox01       PROCEED   OK PROCEED 0.95   2.8  [gemini] The object appears to be a flat piece of paper or cardboard that poses no risk to the vehicle.
+dirtdebris01       PROCEED   OK PROCEED 0.95   3.7  [gemini] The object appears to be a flat piece of paper or debris that poses no risk to the vehicle, making it safe to 
+box03              BYPASS    OK BYPASS 0.95   5.0  [gemini] The object appears to be a rigid box that could cause vehicle damage or loss of control if struck, and the adj
+barrel             BYPASS    OK BYPASS 0.95   4.7  [gemini] The object appears to be a rigid, upright barrel or similar container that poses a collision risk and should n
+trashcan01         BYPASS    OK BYPASS 0.95   8.3  [gemini] The object appears to be a rigid, vertical container or bin that poses a significant risk of vehicle damage if
+trafficcone01      (no photo_d10.jpg found, skipped)
+constructioncone   (no photo_d10.jpg found, skipped)
+photo-only correct: 7/7
+
+== stopped car (GRU-trigger style) ==
+image: none
+  decision: BYPASS
+  confidence: 0.85
+  cues: ['ego stopped for 12.0 s', 'object stopped for 17.0 s', 'no traffic light', 'no movement detected']
+  reason: The vehicle has been stationary for a significant duration with no apparent reason such as a traffic light or junction, suggesting it is likely parked or stalled.
+  latency_s: 2.24
+  mode: gemini

@@ -17,6 +17,7 @@ v2 (shortcut removal): the GRU learned "a 2nd car visible ahead = queue". So now
   StalledCar   : 50% of runs also get a 2nd parked car in front of the stalled one (param lead_car: 0/1/-1=random)
   QueueRelease : 1, 2 or 3 cars (param num_cars, 0 = random) -> a single car that drives off also exists
 """
+import os
 import random
 
 import carla
@@ -99,7 +100,7 @@ class QueueRelease(BasicScenario):
         self.timeout = timeout
         self._distance = get_value_parameter(config, 'distance', float, 40) + _rng.uniform(-8.0, 8.0)
         n = get_value_parameter(config, 'num_cars', int, 0)
-        self._num_cars = n if n > 0 else _rng.choice([1, 2, 3])
+        self._num_cars = n if n > 0 else _rng.choice([2, 3])   # v3: a queue has a reason ahead -> no lone car
         self._gap = _rng.uniform(7.0, 9.0)           # spacing between queued cars (m)
         hmin = get_value_parameter(config, 'hold_min', float, 5.0)
         hmax = get_value_parameter(config, 'hold_max', float, 20.0)
@@ -376,12 +377,27 @@ class RoadDebris(BasicScenario):
             raise ValueError(f"RoadDebris: could not spawn {bp_id}")
         self._prop = prop
         self.other_actors.append(prop)
+        # sit the object ON the road: its pivot is not always at the bottom (some meshes have it in the
+        # middle -> half of the object would be under the asphalt). Move it so the bounding-box bottom = road.
+        spawn_tf = carla.Transform(loc, rot)
+        road_z = tf.location.z          # lane-centre height of the road (a ground ray would hit the object itself)
+        bottom = min(v.z for v in prop.bounding_box.get_world_vertices(spawn_tf))
+        dz = road_z + 0.01 - bottom
+        if abs(dz) > 0.005:
+            prop.set_transform(carla.Transform(loc + carla.Location(z=dz), rot))
+        # PROP_PHYSICS=1: the object is a movable rigid body (gets pushed / knocked away) instead of an
+        # immovable static prop that stops the car like a concrete block
+        self._physics = os.environ.get('PROP_PHYSICS', '0') == '1'
+        if self._physics:
+            prop.set_simulate_physics(True)
         self._end_wp = self._move_forward(wp, 40)
         if self._side_flow:
             self._setup_flow(wp)
         e = prop.bounding_box.extent
-        print(f">> [RoadDebris] {bp_id} ({self._size}) {self._distance:.1f}m ahead, size "
-              f"{2*e.x:.2f} x {2*e.y:.2f} x {2*e.z:.2f} m, NOT registered for the expert")
+        print(f">> [RoadDebris] {bp_id} ({self._size}) {self._distance:.1f}m ahead at "
+              f"({loc.x:.1f}, {loc.y:.1f}), size {2*e.x:.2f} x {2*e.y:.2f} x {2*e.z:.2f} m, "
+              f"bottom was {bottom - road_z:+.2f} m vs road -> moved {dz:+.2f} m, physics={'on' if self._physics else 'off'}, "
+              f"NOT registered for the expert")
 
     def _create_behavior(self):
         root = py_trees.composites.Sequence(name="RoadDebris")
@@ -427,6 +443,20 @@ class NarrowCorridor(BasicScenario):
         self._width = get_value_parameter(config, 'width', float, 3.6)
         self._spacing = get_value_parameter(config, 'spacing', float, 3.0)
         self._oncoming = get_value_parameter(config, 'oncoming', int, 0) == 1
+        # layout: centreline (default) = corridor straddling the centre line (go LEFT)
+        #         lane   = cones on both edges of OUR lane, corridor = our narrowed lane (go STRAIGHT / center)
+        #         closed = rows of cones across both lanes, no way through (WAIT)
+        self._layout = get_value_parameter(config, 'layout', str, 'centreline').lower()
+        self._offset = get_value_parameter(config, 'offset', float, 0.0)
+        # optional sign at the zone entrance (e.g. an arrow board): blueprint, extra yaw (deg), lateral (m, + = right
+        # of our lane centre), metres BEFORE the first cone
+        self._sign_bp = get_value_parameter(config, 'sign', str, '')
+        self._sign_yaw = get_value_parameter(config, 'sign_yaw', float, 0.0)
+        self._sign_lat = get_value_parameter(config, 'sign_lat', float, 1.0)
+        self._sign_before = get_value_parameter(config, 'sign_before', float, 4.0)
+        # arrow drawn on the sign's board (CARLA's arrow board has a blank face): left | right | '' (none)
+        self._sign_arrow = get_value_parameter(config, 'sign_arrow', str, '').lower()
+        self._arrow_h = get_value_parameter(config, 'arrow_h', float, 2.6)
         self._scenario_timeout = 240
         self._cones = []
         super().__init__("NarrowCorridor", ego_vehicles, config, world, randomize, debug_mode,
@@ -446,8 +476,20 @@ class NarrowCorridor(BasicScenario):
             tf = wp.transform
             r = tf.get_right_vector()
             # centre line is half a lane to the LEFT of our lane centre; cones at +-(width/2 + 0.2) from it
-            for side in (+1, -1):
-                lat = -half_lane + side * (self._width / 2.0 + 0.2)
+            if self._layout == 'lane':
+                lats = [self._offset + side * (self._width / 2.0 + 0.2) for side in (+1, -1)]
+            elif self._layout == 'closure':
+                # OUR lane is closed: a short row across the lane at the entrance, then cones along both lane edges
+                edge = half_lane - 0.15
+                lats = [0.0, edge * 0.7] if s == 0.0 else [-edge, edge]
+            elif self._layout == 'closed':
+                lats, x = [], -3.0 * half_lane + 0.5
+                while x <= half_lane - 0.3:
+                    lats.append(x)
+                    x += 1.1
+            else:
+                lats = [-half_lane + side * (self._width / 2.0 + 0.2) for side in (+1, -1)]
+            for lat in lats:
                 loc = tf.location + carla.Location(x=r.x * lat, y=r.y * lat, z=0.05)
                 cone = CarlaDataProvider.request_new_actor('static.prop.constructioncone',
                                                            carla.Transform(loc, tf.rotation), rolename='scenario')
@@ -458,9 +500,39 @@ class NarrowCorridor(BasicScenario):
             s += self._spacing
         if not self._cones:
             raise ValueError("NarrowCorridor: could not spawn any cone")
+        if self._sign_bp:
+            if self._sign_before >= 0:
+                prev = wp0.previous(self._sign_before) if self._sign_before > 0 else [wp0]
+            else:                                    # negative = AFTER the first cone (inside the closed zone)
+                prev = wp0.next(-self._sign_before)
+            swp = prev[0] if prev else wp0
+            stf = swp.transform
+            r = stf.get_right_vector()
+            loc = stf.location + carla.Location(x=r.x * self._sign_lat, y=r.y * self._sign_lat, z=0.05)
+            rot = carla.Rotation(yaw=stf.rotation.yaw + self._sign_yaw)
+            sign = CarlaDataProvider.request_new_actor(self._sign_bp, carla.Transform(loc, rot), rolename='scenario')
+            if sign is not None:
+                sign.set_simulate_physics(False)
+                self.other_actors.append(sign)
+                self._sign = sign
+                print(f">> [NarrowCorridor] sign {sign.type_id} yaw+{self._sign_yaw:.0f} lat {self._sign_lat:+.1f} m, "
+                      f"{self._sign_before:.0f} m before the first cone")
+                if self._sign_arrow in ('left', 'right'):
+                    # big orange arrow just in front of the board, pointing left/right as seen from the ego car
+                    f = stf.get_forward_vector()
+                    c = loc + carla.Location(x=-f.x * 0.35, y=-f.y * 0.35, z=self._arrow_h)
+                    d = -1.0 if self._sign_arrow == 'left' else 1.0
+                    half = 0.65
+                    tail = c + carla.Location(x=-r.x * d * half, y=-r.y * d * half)
+                    head = c + carla.Location(x=r.x * d * half, y=r.y * d * half)
+                    self._world.debug.draw_arrow(tail, head, thickness=0.18, arrow_size=0.45,
+                                                 color=carla.Color(255, 120, 0), life_time=0.0)
+                    print(f">> [NarrowCorridor] arrow '{self._sign_arrow}' drawn on the sign board (h {self._arrow_h} m)")
+            else:
+                print(f">> [NarrowCorridor] could not spawn sign {self._sign_bp}")
         self._end_wp = self._fwd(wp0, self._length + 15.0)
         print(f">> [NarrowCorridor] {len(self._cones)} cones, zone {self._distance:.1f}-{self._distance + self._length:.1f} m "
-              f"ahead, free corridor {self._width:.1f} m on the centre line, NOT registered for the expert")
+              f"ahead, layout={self._layout} (corridor {self._width:.1f} m), NOT registered for the expert")
 
     def _create_behavior(self):
         root = py_trees.composites.Sequence(name="NarrowCorridor")
@@ -481,6 +553,8 @@ class NarrowCorridor(BasicScenario):
             root.add_child(ChangeOppositeBehavior(active=True))
         for c in self._cones:
             root.add_child(ActorDestroy(c))
+        if getattr(self, '_sign', None) is not None:
+            root.add_child(ActorDestroy(self._sign))
         return root
 
     def _create_test_criteria(self):

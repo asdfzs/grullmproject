@@ -4,6 +4,7 @@
 #   .\run_intervene.ps1 165_broken,165_stalled,165_queue              (rule trigger, stub LLM, 1 run each)
 #   .\run_intervene.ps1 165_stalled -Trigger gru                       (GRU trigger, model gru\out_long)
 #   .\run_intervene.ps1 165_stalled -Llm claude                        (real LLM; set $env:ANTHROPIC_API_KEY first)
+#   .\run_intervene.ps1 165_stalled -Llm gemini                        (free Gemini; set $env:GEMINI_API_KEY first)
 #
 # What to expect:
 #   165_broken / 165_stalled : trigger -> LLM says BYPASS -> PDM-Lite changes lane and finishes the route
@@ -12,16 +13,21 @@
 param(
     [Parameter(Mandatory=$true)][string[]]$Ids,
     [ValidateSet('rule','gru')][string]$Trigger = 'rule',
-    [ValidateSet('stub','claude')][string]$Llm = 'stub',
+    [ValidateSet('stub','claude','gemini')][string]$Llm = 'stub',
+    [ValidateSet('full','plain','photo')][string]$LlmInput = 'full',   # full = hints + cue line | plain = raw numbers, no hints | photo = plain + no debris size
     [int]$Reps = 1,
     [double]$TriggerStopSec = 10,
     [string]$GruDir = "C:\carla_garage\gru\out_long_w20s_4hz_final",
     [double]$GruThresh = 0.99,
     [double]$FallbackSec = 12,
-    [ValidateSet('perfect','noisy')][string]$Perception = 'perfect',
+    [ValidateSet('perfect','noisy')][string]$Perception = 'noisy',   # noisy = camera-like (no object name, size +-30%)
     [ValidateSet('llm','always_bypass','off')][string]$DebrisPolicy = 'llm',   # off = PDM-Lite alone ignores debris
     [ValidateSet(0,1)][int]$SafeMerge = 0,   # 0 = PDM-Lite handles the lane change itself (same as the vehicle bypass); 1 = our experimental gap check
-    [switch]$NoTraffic,                      # empty roads: no background traffic at all, only the scenario
+    [switch]$NoTraffic,
+    [double]$MaxStopSec = 150,               # end the run after this long standing still
+    [double]$SpeedCap = 0,                   # km/h, 0 = off (e.g. 30 for the prop tests)
+    [switch]$PropPhotos,                     # photos of the object ahead at 40/20/10/5 m (events folder)
+    [switch]$PropPhysics,                    # debris object can be pushed (movable) instead of an immovable block
     [string]$Suffix = ""   # added to log names, e.g. "_final"
 )
 
@@ -33,7 +39,10 @@ $env:SCENARIO_RUNNER_ROOT = "$env:WORK_DIR\scenario_runner_autopilot"
 $env:LEADERBOARD_ROOT = "$env:WORK_DIR\leaderboard_autopilot"
 $env:PYTHONPATH = "$env:CARLA_ROOT\PythonAPI\carla;$env:SCENARIO_RUNNER_ROOT;$env:LEADERBOARD_ROOT;$env:WORK_DIR\team_code"
 $env:DATAGEN = "0"
-$env:MAX_STOP_SEC = "150"                                         # give the bypass time to happen
+$env:MAX_STOP_SEC = "$MaxStopSec"
+$env:SPEED_CAP_KMH = "$SpeedCap"
+$env:PROP_PHYSICS = if ($PropPhysics) { '1' } else { '0' }
+$env:PROP_PHOTOS = if ($PropPhotos) { '1' } else { '0' }                                         # give the bypass time to happen
 $env:RECORD_DIR = "$env:WORK_DIR\results\intervention_features"   # keep GRU training data clean
 $env:TRIGGER_MODE = $Trigger
 $env:TRIGGER_STOP_SEC = "$TriggerStopSec"
@@ -47,6 +56,7 @@ $env:DEBRIS = if ($DebrisPolicy -eq 'off') { '0' } else { '1' }
 $env:DEBRIS_POLICY = if ($DebrisPolicy -eq 'off') { 'llm' } else { $DebrisPolicy }
 $env:END_AFTER_RELEASE = "0"                                      # (may be left over from run_record.ps1)
 $env:LLM_MODE = $Llm
+$env:LLM_INPUT = $LlmInput
 $PY = "$env:WORK_DIR\venv\Scripts\python.exe"
 New-Item -ItemType Directory -Force "$env:WORK_DIR\results\intervention_logs" | Out-Null
 
