@@ -120,3 +120,24 @@ GRU가 고른 정지(또는 낙하물·공사 콘 감지)에서 Gemini(무료 AP
 - 설정·안전 규칙·변경 내역: [`docs/LLM_STAGE_NOTES.md`](docs/LLM_STAGE_NOTES.md)
 - 실행 기록(LLM 입력·답·제어): `results/llm_runs/<실행>/events.jsonl` · LLM에 보낸 사진: `results/llm_photos/`
 - 실행: `$env:GEMINI_API_KEY = "<키>"` 후 `scripts/run_intervene.ps1 <경로> -Llm gemini` (키는 코드·저장소에 없음)
+
+## 하이브리드 판단 구조 (2026-11-12)
+
+| 상황 | 누가 판단 | 비고 |
+| --- | --- | --- |
+| 정지차 | 작은 모델(`models/distill/model_all.pt`, 사진 없음) | 애매한 경우(비상등 없음 + 앞에 차 + 8~45초 정지) 또는 확신 < 0.7 이면 Gemini(사진) 호출, 20초 이상은 기다림 정책(규칙) |
+| 낙하물 | 높이 규칙 (0.20 m 미만 PROCEED, 이상 BYPASS) | LLM 호출 없음 (`DEBRIS_DECIDER=llm` 으로 되돌릴 수 있음) |
+| 공사장 | Gemini (사진) | 화살표 방향은 사진에만 있음 |
+
+모든 판단 뒤에 안전 규칙(`guard`)이 한 번 더 확인한다.
+
+실행: 모델 파일을 `C:\carla_garage\results\distill_dataset\` 에 복사한 뒤
+
+```powershell
+$env:GEMINI_API_KEY = "<your key>"     # PowerShell 에서만, 코드/깃허브/카톡에 넣지 않기
+.\run_intervene.ps1 165_broken -Trigger gru -Llm distill
+.\run_intervene.ps1 m1_closure_left -Trigger gru -Llm distill -LlmInput photo -NoTraffic
+```
+
+- `tools/check_distill_offline.py`: CARLA 없이 실제 주행 기록으로 작은 모델 채점
+- `results/llm_runs_hybrid/`: 최종 구조로 돌린 실행 기록(`events.jsonl`, LLM에 보낸 사진). `decided_by` 로 누가 판단했는지 확인

@@ -105,7 +105,7 @@ class InterventionAgent(RecordingAgent):
     self._pending_t = None
     self._handled = set()          # actor ids already handed to PDM-Lite
     self._backing_up = None        # (actor, direction, t_start) while reversing
-    self._use_cam = env('LLM_CAMERA', '1' if self._advisor.mode in ('claude', 'gemini') else '0') == '1'
+    self._use_cam = env('LLM_CAMERA', '1' if self._advisor.mode in ('claude', 'gemini', 'distill') else '0') == '1'
     self._debris_photo_m = float(env('DEBRIS_PHOTO_M', '12'))   # debris: take the LLM photo this close (far = too small)
     self._snap_cam = None
     self._snap_img = None
@@ -1218,7 +1218,7 @@ class InterventionAgent(RecordingAgent):
     summary += build_summary({**row, **self._lane_kinds()})
     drow = dict(row)
     # the size is always measured and always goes to the SAFETY RULES; LLM_INPUT=photo only hides it from the LLM
-    drow.update(kind='debris', obj_type=name, obj_h=H, obj_w=W, obj_l=L, adj_busy=busy, adj_count=n,
+    drow.update(kind='debris', obj_type=name, obj_h=H, obj_w=W, obj_l=L, adj_busy=busy, adj_count=n, gap_m=round(gap, 1),
                 adj_possible=side is not None)
     self._log('trigger', call=self._calls, by='debris_detected', kind='debris', perception=self._perception,
               front=a.type_id, front_id=a.id, gap_m=round(gap, 1), obj_h_true=round(2 * e.z, 2), obj_h_est=round(H, 2),

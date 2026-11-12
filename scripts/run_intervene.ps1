@@ -13,7 +13,7 @@
 param(
     [Parameter(Mandatory=$true)][string[]]$Ids,
     [ValidateSet('rule','gru')][string]$Trigger = 'rule',
-    [ValidateSet('stub','claude','gemini')][string]$Llm = 'stub',
+    [ValidateSet('stub','claude','gemini','distill')][string]$Llm = 'stub',
     [ValidateSet('full','plain','photo')][string]$LlmInput = 'full',   # full = hints + cue line | plain = raw numbers, no hints | photo = plain + no debris size
     [int]$Reps = 1,
     [double]$TriggerStopSec = 10,

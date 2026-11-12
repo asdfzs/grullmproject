@@ -84,10 +84,64 @@ class StalledCar(BrokenDownCar):
             except Exception as e:
                 print(f">> [StalledCar] could not spawn 2nd car: {e}")
 
+        self._spawn_cues(config)
+
         self._end_wp = self._move_waypoint_forward(self._vehicle_wp, self._end_distance)
         # NOT registered in CarlaDataProvider.active_scenarios
         print(f">> [StalledCar] {car.type_id} (id={car.id}) {self._distance:.1f}m ahead, "
               f"no hazard lights, NOT registered for the expert")
+
+
+    def _spawn_cues(self, config):
+        """v3: optional visual signs of a breakdown, visible ONLY in the camera photo (not in the text summary).
+        person=1   : the driver stands on the shoulder next to the rear of the stalled car, facing it
+        triangle=X : a warning triangle on the shoulder X m behind the stalled car's rear (outside our lane). The ego stops
+                     ~4 m behind the car and the photo is taken there, so X must be < ~3 m to be in the picture."""
+        person = get_value_parameter(config, 'person', int, 0)
+        tri_m = get_value_parameter(config, 'triangle', float, 0.0)
+        if not person and tri_m <= 0:
+            return
+        wp = self._vehicle_wp
+        base = wp.transform.location
+        yaw = wp.transform.rotation.yaw
+        fwd = wp.transform.get_forward_vector()
+        rgt = wp.transform.get_right_vector()
+        sgn = 1.0 if self._direction == 'right' else -1.0
+        lw = wp.lane_width
+        car_lat = self._offset * lw / 2.0                     # stalled car centre, from the lane centre
+
+        def at(lon, lat, dz):
+            return carla.Location(x=base.x + fwd.x * lon + rgt.x * sgn * lat,
+                                  y=base.y + fwd.y * lon + rgt.y * sgn * lat, z=base.z + dz)
+
+        if person:
+            walker = None
+            for lat in (car_lat + 1.3, car_lat + 1.6, car_lat + 2.0, car_lat + 2.5):
+                tf = carla.Transform(at(-2.4, lat, 1.0), carla.Rotation(yaw=yaw - 90.0 * sgn))
+                try:
+                    walker = CarlaDataProvider.request_new_actor('walker.pedestrian.*', tf, rolename='scenario')
+                except Exception:
+                    walker = None
+                if walker:
+                    break
+            if walker:
+                self.other_actors.append(walker)
+                print(f">> [StalledCar] + person {walker.type_id} standing next to it ({lat:.1f} m from lane centre)")
+            else:
+                print(">> [StalledCar] !! could not spawn the person")
+
+        if tri_m > 0:
+            tf = carla.Transform(at(-(2.3 + tri_m), lw / 2.0 + 0.3, 0.2), carla.Rotation(yaw=yaw + 90.0))
+            try:
+                tri = CarlaDataProvider.request_new_actor('static.prop.warningaccident', tf)
+            except Exception:
+                tri = None
+            if tri:
+                tri.set_simulate_physics(False)
+                self.other_actors.append(tri)
+                print(f">> [StalledCar] + warning triangle {tri_m:.0f} m behind it (on the shoulder)")
+            else:
+                print(">> [StalledCar] !! could not spawn the warning triangle")
 
 
 class QueueRelease(BasicScenario):

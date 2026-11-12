@@ -1,0 +1,2 @@
+{"t": 0.0, "event": "start", "trigger": "gru", "llm": "distill", "trig_stop": 10.0, "llm_input": "full", "perception": "noisy"}
+{"t": 30.6, "event": "end", "calls": 0, "handed": 0}

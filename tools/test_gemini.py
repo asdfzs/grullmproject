@@ -1,4 +1,4 @@
-"""
+r"""
 Gemini API check BEFORE running CARLA (free tier: no cost).
     $env:GEMINI_API_KEY = "<your key>"
     venv\Scripts\python.exe tools\test_gemini.py
@@ -14,9 +14,11 @@ sys.path.insert(0, os.path.join(ROOT, 'team_code'))
 os.environ['LLM_MODE'] = 'gemini'
 from llm_advisor import LLMAdvisor, build_summary
 
-KEY = os.environ.get('GEMINI_API_KEY')
+KEY = (os.environ.get('GEMINI_API_KEY') or '').strip()
+if KEY:
+    os.environ['GEMINI_API_KEY'] = KEY
 if not KEY:
-    sys.exit('GEMINI_API_KEY is not set. In PowerShell:  $env:GEMINI_API_KEY = "<your key>"')
+    sys.exit('GEMINI_API_KEY is empty (or only a space/newline). In PowerShell, on ONE line:  $env:GEMINI_API_KEY = "<your key>"')
 
 out = []
 def say(s=''):

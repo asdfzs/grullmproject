@@ -17,6 +17,7 @@ Answer format (both modes): {"decision": "BYPASS"|"WAIT", "confidence": 0..1, "c
 """
 import os
 import json
+import re
 import time
 import base64
 import threading
@@ -282,6 +283,9 @@ def guard(res, row):
 
 class LLMAdvisor:
     def __init__(self):
+        for k in ('GEMINI_API_KEY', 'ANTHROPIC_API_KEY'):   # a pasted key often carries a newline/space -> invalid header
+            if os.environ.get(k) and os.environ[k] != os.environ[k].strip():
+                os.environ[k] = os.environ[k].strip()
         self.mode = os.environ.get('LLM_MODE', 'stub').lower()
         self.model = os.environ.get('LLM_MODEL') or ('gemini-3-flash-preview' if self.mode == 'gemini' else 'claude-sonnet-5-5')
         self.timeout = float(os.environ.get('LLM_TIMEOUT', '20'))
@@ -296,7 +300,17 @@ class LLMAdvisor:
         if self.mode == 'gemini' and not os.environ.get('GEMINI_API_KEY'):
             print('>> [LLMAdvisor] LLM_MODE=gemini but GEMINI_API_KEY is not set -> falling back to stub', flush=True)
             self.mode = 'stub'
-        print(f'>> [LLMAdvisor] mode={self.mode}' + (f' model={self.model}' if self.mode in ('claude', 'gemini') else ''), flush=True)
+        if self.mode == 'distill':
+            # small distilled model answers first; unsure (or a kind it does not handle) -> real Gemini
+            self.model = os.environ.get('LLM_MODEL') or 'gemini-3-flash-preview'
+            self.distill_thresh = float(os.environ.get('DISTILL_UNCERTAINTY_THRESH', '0.7'))
+            self.distill_kinds = set(k.strip() for k in os.environ.get('DISTILL_KINDS', 'vehicle').split(',') if k.strip())
+            self.distill_fallback = 'gemini' if os.environ.get('GEMINI_API_KEY') else 'stub'
+            self._load_distill_model()
+            print(f'>> [LLMAdvisor] mode=distill kinds={sorted(self.distill_kinds)} thresh={self.distill_thresh} '
+                  f'fallback={self.distill_fallback} ({self.model})', flush=True)
+        else:
+            print(f'>> [LLMAdvisor] mode={self.mode}' + (f' model={self.model}' if self.mode in ('claude', 'gemini') else ''), flush=True)
 
     # ---------------------------------------------------------------- public
     def busy(self):
@@ -324,8 +338,18 @@ class LLMAdvisor:
             prompt = {'debris': DEBRIS_PROMPT_PLAIN, 'corridor': CORRIDOR_PROMPT_PLAIN}.get(row.get('kind'),
                                                                                            SYSTEM_PROMPT_PLAIN)
         used = self.mode
+        if row.get('kind') == 'debris' and os.environ.get('DEBRIS_DECIDER', 'rule').lower() == 'rule':
+            # debris is decided by the measured height (tested: a height threshold is enough in CARLA, see the
+            # project notes) -> no LLM call. DEBRIS_DECIDER=llm sends debris to the LLM / small model again.
+            res = guard(self._debris_height_rule(row), row)
+            res['latency_s'] = round(time.time() - self._t0, 2)
+            res['mode'] = 'height_rule'
+            self._result = res
+            return
         try:
-            if self.mode == 'claude':
+            if self.mode == 'distill':
+                res = self._ask_distill(jpeg_bytes, summary, row, prompt)
+            elif self.mode == 'claude':
                 res = self._ask_claude(jpeg_bytes, summary, prompt)
             elif self.mode == 'gemini':
                 res = self._ask_gemini(jpeg_bytes, summary, prompt)
@@ -338,6 +362,11 @@ class LLMAdvisor:
                     err += ' | ' + e.read().decode('utf-8', 'replace')[:300]
                 except Exception:
                     pass
+            for k in ('GEMINI_API_KEY', 'ANTHROPIC_API_KEY'):   # never write a key into logs / events.jsonl
+                v = os.environ.get(k, '').strip()
+                if v and len(v) > 8:
+                    err = err.replace(v, '<API-KEY>')
+            err = re.sub(r'(AIza|AQ\.|sk-ant-)[A-Za-z0-9_\-.]{8,}', '<API-KEY>', err)
             print(f'>> [LLMAdvisor] {self.mode} call failed -> stub answers instead: {err}', flush=True)
             try:
                 self.stub_delay, d = 0.0, self.stub_delay
@@ -351,6 +380,105 @@ class LLMAdvisor:
         res['latency_s'] = round(time.time() - self._t0, 2)
         res['mode'] = used
         self._result = res
+
+    # ---------------------------------------------------------------- distilled small model (team: model_all)
+    def _load_distill_model(self):
+        import torch
+        import torch.nn as nn
+
+        class DistillMLPAll(nn.Module):
+            def __init__(self, n_in, h1=48, h2=24, n_classes=3):
+                super().__init__()
+                self.net = nn.Sequential(nn.Linear(n_in, h1), nn.ReLU(), nn.Linear(h1, h2), nn.ReLU(),
+                                         nn.Linear(h2, n_classes))
+
+            def forward(self, x):
+                return self.net(x)
+
+        d = os.environ.get('DISTILL_MODEL_DIR') or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                                               'results', 'distill_dataset')
+        with open(os.path.join(d, 'model_all_norm.json')) as f:
+            norm = json.load(f)
+        model = DistillMLPAll(n_in=norm['n_in'])
+        model.load_state_dict(torch.load(os.path.join(d, 'model_all.pt'), map_location='cpu'))
+        model.eval()
+        self._distill_model, self._distill_norm, self._distill_torch = model, norm, torch
+
+    @staticmethod
+    def _distill_vec(row):
+        """47-d input, same layout as the team's rebuild_dataset_47d.to_vec47():
+        [0:34] GRU features | [34:37] obj_h, debris_gap_m, adj_busy | [37:40] corridor_width_m, n_cones, oncoming
+        | [40:44] adj_count, ego_speed_kmh, ego_width, oncoming_dist | [44:47] kind one-hot (broken, debris, corridor)"""
+        kind = row.get('kind', 'vehicle')
+        f = lambda k, d=0.0: float(row.get(k, d) if row.get(k) is not None else d)
+        if kind == 'debris':
+            return ([0.0] * 34 + [f('obj_h'), f('gap_m'), 1.0 if row.get('adj_busy') else 0.0, 0.0, 0.0, 0.0]
+                    + [f('adj_count'), f('ego_speed_kmh'), 0.0, 0.0] + [0.0, 1.0, 0.0])
+        if kind == 'corridor':
+            return ([0.0] * 34 + [0.0, 0.0, 0.0, f('corr_width'), f('n_cones'), f('oncoming_n')]
+                    + [0.0, f('ego_speed_kmh'), f('ego_width', 2.0), f('oncoming_dist')] + [0.0, 0.0, 1.0])
+        from gru_features import featurize
+        return list(featurize(row)) + [0.0] * 10 + [1.0, 0.0, 0.0]
+
+    @staticmethod
+    def _distill_ambiguous(row):
+        """Vehicle stop that numbers alone cannot settle: no hazard lights, ANOTHER stopped vehicle right in front of
+        the stopped one (looks like a queue, could be two parked/stalled cars), and the ego has waited 8-45 s (the GRU asks from 8 s on).
+        Real queues and stalled cars give identical numbers here, so the small model is not trusted (it answered
+        these with p>0.95 either way) -> always ask the LLM, which can look at the photo (person, triangle, ...).
+        Shorter stops: WAIT is cheap. Longer stops: the patience policy (a rule) handles it."""
+        if row.get('kind', 'vehicle') != 'vehicle':
+            return False
+        f = lambda k, d: float(row.get(k, d) if row.get(k) not in (None, '') else d)
+        lo = float(os.environ.get('DISTILL_AMBIG_MIN_S', '8'))
+        hi = float(os.environ.get('DISTILL_AMBIG_MAX_S', '45'))
+        return (f('front_hazard_on', 0) <= 0
+                and f('front2_dist_m', 999) < 50 and f('front2_speed_ms', 0) < 0.5
+                and lo <= f('stop_duration_s', 0) < hi)
+
+    def _ask_distill(self, jpeg_bytes, summary, row, prompt):
+        kind = row.get('kind', 'vehicle')
+        ask_llm = (lambda: self._ask_gemini(jpeg_bytes, summary, prompt)) if self.distill_fallback == 'gemini' \
+            else (lambda: self._ask_stub(row))
+        if kind not in self.distill_kinds:
+            res = ask_llm()
+            res['decided_by'] = f'llm_direct({self.distill_fallback})'
+            return res
+        import numpy as np
+        v = np.array(self._distill_vec(row), dtype=np.float32)
+        v = (v - np.array(self._distill_norm['mean'], dtype=np.float32)) / np.array(self._distill_norm['std'], dtype=np.float32)
+        with self._distill_torch.no_grad():
+            p = self._distill_torch.softmax(self._distill_model(self._distill_torch.tensor(v).unsqueeze(0)), dim=1)[0].numpy()
+        classes = self._distill_norm['classes']
+        i = int(p.argmax())
+        probs = {c: round(float(x), 3) for c, x in zip(classes, p)}
+        if self._distill_ambiguous(row):
+            res = ask_llm()
+            res['decided_by'] = f'llm_ambiguous({self.distill_fallback})'
+        elif float(p[i]) < self.distill_thresh:
+            res = ask_llm()
+            res['decided_by'] = f'llm_fallback({self.distill_fallback})'
+        else:
+            res = {'decision': classes[i], 'confidence': round(float(p[i]), 3), 'cues': [],
+                   'reason': f'small model (model_all) p={float(p[i]):.2f}', 'decided_by': 'model_all'}
+        res['model_all_probs'] = probs
+        return res
+
+    @staticmethod
+    def _debris_height_rule(row):
+        thr = float(os.environ.get('DEBRIS_PROCEED_MAX_H', '0.20'))
+        h = float(row.get('obj_h') if row.get('obj_h') is not None else 1.0)
+        busy = bool(row.get('adj_busy', False))
+        cues = [f'measured height {h:.2f} m (threshold {thr:.2f} m)',
+                f"bypass lane {'busy' if busy else 'free'} ({row.get('adj_count', 0)} cars)"]
+        if h < thr:
+            return {'decision': 'PROCEED', 'confidence': 1.0, 'cues': cues, 'decided_by': 'height_rule',
+                    'reason': f'height {h:.2f} m < {thr:.2f} m: low enough to drive over'}
+        if not row.get('adj_possible', True):
+            return {'decision': 'WAIT', 'confidence': 1.0, 'cues': cues, 'decided_by': 'height_rule',
+                    'reason': f'height {h:.2f} m >= {thr:.2f} m and no lane to go around: stop and wait'}
+        return {'decision': 'BYPASS', 'confidence': 1.0, 'cues': cues, 'decided_by': 'height_rule',
+                'reason': f'height {h:.2f} m >= {thr:.2f} m: must not be hit, change lanes around it'}
 
     def _ask_stub(self, row):
         """Stand-in for the LLM. Uses only cues a camera could see; NOT the scenario name."""
@@ -417,7 +545,7 @@ class LLMAdvisor:
         res['raw'] = text
         return res
 
-    def _ask_gemini(self, jpeg_bytes, summary, system_prompt=SYSTEM_PROMPT):
+    def _ask_gemini(self, jpeg_bytes, summary, system_prompt=SYSTEM_PROMPT, _retry=True):
         parts = []
         if jpeg_bytes:
             parts.append({'inline_data': {'mime_type': 'image/jpeg',
@@ -426,7 +554,7 @@ class LLMAdvisor:
         body = json.dumps({
             'system_instruction': {'parts': [{'text': system_prompt}]},
             'contents': [{'role': 'user', 'parts': parts}],
-            'generationConfig': {'temperature': 0.0, 'maxOutputTokens': 2048,
+            'generationConfig': {'temperature': 0.0, 'maxOutputTokens': 8192,
                                  'responseMimeType': 'application/json'},
         }).encode('utf-8')
         # free-tier models are sometimes "overloaded" (503) or out of quota (429): try a 2nd model before giving up
@@ -456,7 +584,15 @@ class LLMAdvisor:
             raise RuntimeError(f'no answer: {json.dumps(data)[:200]}')
         text = ''.join(p.get('text', '') for p in cands[0].get('content', {}).get('parts', [])
                        if not p.get('thought'))
-        res = _parse_json(text)
+        try:
+            res = _parse_json(text)
+        except ValueError:
+            # seen once: empty text (the model spent its output budget on thinking) -> ask once more
+            why = cands[0].get('finishReason')
+            if not _retry:
+                raise
+            print(f'>> [LLMAdvisor] empty/unparsable answer (finishReason={why}) -> asking once more', flush=True)
+            return self._ask_gemini(jpeg_bytes, summary, system_prompt, _retry=False)
         res['raw'] = text
         res['model'] = self.used_model
         return res

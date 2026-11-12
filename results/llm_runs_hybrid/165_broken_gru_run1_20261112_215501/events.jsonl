@@ -1,0 +1,8 @@
+{"t": 0.0, "event": "start", "trigger": "gru", "llm": "distill", "trig_stop": 10.0, "llm_input": "full", "perception": "noisy"}
+{"t": 6.85, "event": "trigger", "call": 1, "by": "gru", "stop_s": 1.15, "p_gru": 0.999, "front": "vehicle.mercedes.coupe_2020", "front_id": 140, "image": "call1_t6.9.jpg", "summary": "ego stopped for 1.1 s (speed 0.0 km/h)\nobject ahead in ego lane: vehicle_stopped, gap 3.9 m, its speed 0.0 m/s, stopped for 5.2 s, hazard lights ON\nsecond object ahead in ego lane: none\nleft lane (same direction): 2 vehicles, mean speed 8.7 m/s\nright lane: there is NO right lane (road edge / no driving lane)\ntraffic light ahead: none within 80 m\nego at junction: no\ncues: the road ahead of the stopped vehicle is FREE (no vehicle within ~50 m), yet it does not move; traffic in the neighbouring lane keeps passing it: left lane (8.7 m/s); it was already standing still before we arrived (4 s before us)"}
+{"t": 6.9, "event": "llm_answer", "sim_wait_s": 0.05, "decision": "BYPASS", "confidence": 1.0, "cues": [], "reason": "small model (model_all) p=1.00", "decided_by": "model_all", "model_all_probs": {"WAIT": 0.0, "BYPASS": 1.0, "PROCEED": 0.0}, "latency_s": 0.01, "mode": "distill"}
+{"t": 6.9, "event": "backup_start", "gap_m": 3.91, "target_gap_m": 7.0}
+{"t": 9.65, "event": "backup_done", "gap_m": 7.0, "took_s": 2.8}
+{"t": 9.65, "event": "handed_to_planner", "actor": "vehicle.mercedes.coupe_2020", "actor_id": 140, "scenario_type": "ParkedObstacle", "direction": "right"}
+{"t": 12.1, "event": "bypass_lane_changed", "after_s": 2.5}
+{"t": 18.2, "event": "end", "calls": 1, "handed": 1}
